@@ -1,23 +1,33 @@
-# Use the official Node.js runtime as base image
-FROM node:20-alpine
+# Multi-stage build
+FROM node:20-alpine AS builder
 
-# Set the working directory in the container
+# Set working directory
 WORKDIR /app
 
-# Copy package.json only
+# Copy package files
 COPY package.json ./
 
-# Install dependencies (fresh install for Linux platform)
-RUN npm install --omit=dev
+# Remove problematic Windows dependency and install
+RUN npm pkg delete dependencies.lightningcss-win32-x64-msvc && \
+    npm install
 
-# Copy the rest of the application code
+# Copy source code
 COPY . .
 
 # Build the application
 RUN npm run build
 
-# Expose port 4173 for preview mode
-EXPOSE 4173
+# Production stage
+FROM node:20-alpine AS production
 
-# Start the application in preview mode
-CMD ["npm", "run", "preview", "--", "--host", "0.0.0.0"]
+# Install serve to host the built files
+RUN npm install -g serve
+
+# Copy built files from builder stage
+COPY --from=builder /app/dist /app
+
+# Expose port 3000
+EXPOSE 3000
+
+# Start the application
+CMD ["serve", "-s", "/app", "-l", "3000"]
