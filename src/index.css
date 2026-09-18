@@ -1,0 +1,145 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", "Segoe UI", system-ui, sans-serif;
+  --color-canvas: #f8f9ff;
+  --color-ink: #1e1b4b;
+  --color-soft: #6366f1;
+  --color-line: #4338ca;
+  --color-dot: #c7cbe8;
+  --color-ready: #22c55e;
+  --color-accent-blue: #3b82f6;
+}
+
+html,
+body,
+#root {
+  height: 100svh;
+  max-height: 100svh;
+  margin: 0;
+  overflow: hidden;
+}
+
+html {
+  scrollbar-width: none;
+}
+
+html::-webkit-scrollbar {
+  display: none;
+}
+
+body {
+  font-family: var(--font-sans);
+  color: var(--color-ink);
+  background: var(--color-canvas);
+}
+
+.dot-grid {
+  background-color: #f5f7ff;
+  background-image:
+    radial-gradient(circle at top, rgb(99 102 241 / .08), transparent 42%),
+    radial-gradient(#c7cbe8 1.1px, transparent 1.1px);
+  background-size: auto, 22px 22px;
+}
+
+button {
+  font: inherit;
+}
+
+@keyframes rise {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes live-dot {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.55); opacity: .45; }
+}
+
+.rise {
+  animation: rise .5s cubic-bezier(.22, 1, .36, 1) both;
+}
+
+.node-card {
+  --rx: 0deg;
+  --ry: 0deg;
+  transform: perspective(900px) rotateX(var(--rx)) rotateY(var(--ry));
+  transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease;
+}
+
+.node-card.is-hot:hover {
+  z-index: 3;
+  transform: perspective(900px) rotateX(var(--rx)) rotateY(var(--ry)) translateY(-5px) scale(1.025);
+}
+
+.node-card.is-hot:active {
+  transform: perspective(900px) scale(.985);
+}
+
+.node-spot {
+  background: radial-gradient(180px circle at var(--mx, 50%) var(--my, 50%), rgb(255 255 255 / .55), transparent 58%);
+  opacity: 0;
+  transition: opacity .2s ease;
+}
+
+.node-card.is-hot:hover .node-spot {
+  opacity: 1;
+}
+
+.live-dot {
+  animation: live-dot 1.6s ease-in-out infinite;
+}
+
+.map-pin-wrap {
+  background: none;
+  border: 0;
+}
+
+.map-pin {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  background: #4f46e5;
+  color: #fff;
+  font: 700 8px/1 Inter, sans-serif;
+  letter-spacing: .04em;
+  box-shadow: 0 8px 16px rgb(67 56 202 / .35);
+  border: 2px solid #fff;
+}
+
+.map-pin.is-on {
+  transform: scale(1.12);
+  background: #312e81;
+  box-shadow: 0 0 0 6px rgb(99 102 241 / .25), 0 10px 20px rgb(67 56 202 / .4);
+}
+
+.map-pin.pin-blue { background: #2563eb; }
+.map-pin.pin-violet { background: #7c3aed; }
+.map-pin.pin-green { background: #16a34a; }
+.map-pin.pin-amber { background: #d97706; }
+.map-pin.pin-rose { background: #e11d48; }
+
+.leaflet-container {
+  font-family: inherit;
+  background: #eef2ff;
+}
+
+.leaflet-top.leaflet-left {
+  top: 10px;
+  left: 10px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rise,
+  .live-dot {
+    animation: none;
+  }
+
+  .node-card,
+  .node-card.is-hot:hover,
+  .node-card.is-hot:active {
+    transform: none;
+  }
+}
