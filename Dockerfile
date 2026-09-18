@@ -4,11 +4,11 @@ FROM node:20-alpine
 # Set the working directory in the container
 WORKDIR /app
 
-# Copy package.json and package-lock.json
-COPY package*.json ./
+# Copy package.json only
+COPY package.json ./
 
-# Install dependencies (skip optional dependencies to avoid platform-specific packages)
-RUN npm ci --omit=dev --no-optional
+# Install dependencies (fresh install for Linux platform)
+RUN npm install --omit=dev
 
 # Copy the rest of the application code
 COPY . .
