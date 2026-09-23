@@ -2,8 +2,12 @@ import { useEffect, useRef, useState } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import medianData from '../../../../../assets/data/nanasa-median.json'
-import { buildCorridorPolygons } from './road3dGeometry'
+import { buildCorridorPolygons, snapLatLngToRoad } from './road3dGeometry'
 import NanasaRoad3DModal from './NanasaRoad3DModal'
+
+const CHAINAGE_MIN_KM = 95
+const CHAINAGE_MAX_KM = 142.94
+const SNAP_MAX_M = 450
 
 const pin = (p, on) => L.divIcon({
   className: 'map-pin-wrap',
@@ -53,6 +57,11 @@ export default function ProjectsMap({
   const [base, setBase] = useState('streets')
   const [show3dLayer, setShow3dLayer] = useState(false)
   const [show3dModal, setShow3dModal] = useState(false)
+  const [entry3d, setEntry3d] = useState({ key: 0, chainageKm: null, pathMode: null })
+  const [pegDrag, setPegDrag] = useState(null) // { x, y } viewport coords while dragging
+  const [pegHint, setPegHint] = useState('')
+  const snapPreview = useRef(null)
+  const pegActive = useRef(false)
   hover.current = onHover
   select.current = onSelect
   opt.current = { maxZoom, pad }
@@ -271,8 +280,110 @@ export default function ProjectsMap({
     on3dModalChange?.(show3dModal)
   }, [show3dModal, on3dModalChange])
 
+  const clearSnapPreview = () => {
+    const m = map.current
+    if (m && snapPreview.current) {
+      m.removeLayer(snapPreview.current)
+      snapPreview.current = null
+    }
+  }
+
+  const updateSnapPreview = (latlng) => {
+    const m = map.current
+    if (!m || !latlng) return
+    const snap = snapLatLngToRoad(
+      latlng.lat,
+      latlng.lng,
+      medianData.coordinates,
+      CHAINAGE_MIN_KM,
+      CHAINAGE_MAX_KM,
+      SNAP_MAX_M,
+    )
+    clearSnapPreview()
+    if (!snap) {
+      setPegHint('Drop on the Nanasa corridor')
+      return null
+    }
+    const icon = L.divIcon({
+      className: '',
+      iconSize: [28, 28],
+      iconAnchor: [14, 14],
+      html: `<div style="width:28px;height:28px;border-radius:999px;border:3px solid #fff;background:${snap.pathMode === 'lhs' ? '#22c55e' : snap.pathMode === 'rhs' ? '#3b82f6' : '#f59e0b'};box-shadow:0 2px 10px rgba(0,0,0,.35)"></div>`,
+    })
+    snapPreview.current = L.marker([snap.lat, snap.lng], { icon, interactive: false, zIndexOffset: 2000 }).addTo(m)
+    const side = snap.pathMode === 'lhs' ? 'LHS' : snap.pathMode === 'rhs' ? 'RHS' : 'Median'
+    setPegHint(`${side} · Ch ${snap.chainageKm.toFixed(2)} km`)
+    return snap
+  }
+
+  const open3dAt = (snap) => {
+    if (!snap) return
+    setShow3dLayer(true)
+    setEntry3d((prev) => ({
+      key: prev.key + 1,
+      chainageKm: snap.chainageKm,
+      pathMode: snap.pathMode,
+    }))
+    setShow3dModal(true)
+    setPegHint('')
+  }
+
+  const onPegPointerDown = (e) => {
+    if (!enable3dRoad || show3dModal) return
+    e.preventDefault()
+    e.currentTarget.setPointerCapture?.(e.pointerId)
+    const m = map.current
+    if (m) m.dragging.disable()
+    if (!show3dLayer) setShow3dLayer(true)
+    pegActive.current = true
+    setPegDrag({ x: e.clientX, y: e.clientY })
+    setPegHint('Drop on the road to open 3D')
+  }
+
+  const finishPegDrag = (clientX, clientY) => {
+    if (!pegActive.current) return
+    pegActive.current = false
+    const m = map.current
+    const el = wrap.current
+    if (m) m.dragging.enable()
+    let snap = null
+    if (m && el) {
+      const rect = el.getBoundingClientRect()
+      const pt = L.point(clientX - rect.left, clientY - rect.top)
+      const latlng = m.containerPointToLatLng(pt)
+      snap = updateSnapPreview(latlng)
+    }
+    clearSnapPreview()
+    setPegDrag(null)
+    if (snap) open3dAt(snap)
+    else setPegHint('Drop closer to the corridor')
+  }
+
+  useEffect(() => {
+    if (!pegDrag) return undefined
+    const move = (ev) => {
+      if (!pegActive.current) return
+      setPegDrag({ x: ev.clientX, y: ev.clientY })
+      const m = map.current
+      const el = wrap.current
+      if (!m || !el) return
+      const rect = el.getBoundingClientRect()
+      const pt = L.point(ev.clientX - rect.left, ev.clientY - rect.top)
+      updateSnapPreview(m.containerPointToLatLng(pt))
+    }
+    const up = (ev) => finishPegDrag(ev.clientX, ev.clientY)
+    window.addEventListener('pointermove', move)
+    window.addEventListener('pointerup', up)
+    window.addEventListener('pointercancel', up)
+    return () => {
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', up)
+      window.removeEventListener('pointercancel', up)
+    }
+  }, [pegDrag]) // eslint-disable-line react-hooks/exhaustive-deps
+
   return (
-    <div className={`absolute inset-0 h-full w-full ${show3dModal ? 'z-[1100]' : 'z-0'}`}>
+    <div className={`absolute inset-0 h-full w-full ${show3dModal ? 'z-[1100]' : 'z-[450]'}`}>
       <div ref={wrap} className="absolute inset-0" />
       {!show3dModal && (
       <div className="absolute left-3 top-[8.5rem] z-[1000] flex flex-col overflow-hidden rounded-xl border border-white/80 bg-white/92 shadow-lg backdrop-blur">
@@ -298,8 +409,11 @@ export default function ProjectsMap({
             {show3dLayer && (
               <button
                 type="button"
-                onClick={() => setShow3dModal(true)}
-                className={`px-3 py-1.5 text-left text-[12px] font-semibold transition ${show3dModal ? 'bg-indigo-600 text-white' : 'text-indigo-950 hover:bg-indigo-50'}`}
+                onClick={() => {
+                  setEntry3d((prev) => ({ ...prev, key: prev.key + 1 }))
+                  setShow3dModal(true)
+                }}
+                className="px-3 py-1.5 text-left text-[12px] font-semibold text-indigo-950 transition hover:bg-indigo-50"
               >
                 Open 3D view
               </button>
@@ -308,6 +422,54 @@ export default function ProjectsMap({
         )}
       </div>
       )}
+
+      {/* Pegman-style control — left side so inventory panel does not cover it */}
+      {enable3dRoad && !show3dModal && (
+        <div className="pointer-events-none absolute bottom-28 left-3 z-[1000] flex flex-col items-start gap-2">
+          {pegHint ? (
+            <div className="max-w-[200px] rounded-lg border border-white/70 bg-slate-900/90 px-2.5 py-1.5 text-[11px] font-semibold text-white shadow-lg backdrop-blur">
+              {pegHint}
+            </div>
+          ) : (
+            <div className="max-w-[160px] rounded-lg border border-indigo-100 bg-white/95 px-2 py-1 text-[10px] font-semibold text-indigo-800 shadow">
+              Drag onto road → 3D
+            </div>
+          )}
+          <button
+            type="button"
+            onPointerDown={onPegPointerDown}
+            title="Drag onto the road to open 3D view at that point"
+            aria-label="Drag 3D view peg onto the road"
+            className={`pointer-events-auto flex h-16 w-14 cursor-grab flex-col items-center justify-end rounded-2xl border-2 border-amber-300 bg-white pb-1.5 shadow-[0_8px_24px_rgba(15,23,42,0.25)] active:cursor-grabbing ${pegDrag ? 'opacity-30' : 'hover:scale-105 hover:bg-amber-50'}`}
+          >
+            <span className="flex h-10 w-10 items-center justify-center rounded-full bg-amber-400 text-slate-900 shadow-md" aria-hidden>
+              <svg viewBox="0 0 24 24" className="h-6 w-6" fill="currentColor">
+                <circle cx="12" cy="5" r="2.2" />
+                <path d="M12 8.2c-1.6 0-2.8 1.1-2.8 2.6v3.2l-1.5 5.2h1.7l1.3-4.4h.6l1.3 4.4h1.7l-1.5-5.2v-3.2c0-1.5-1.2-2.6-2.8-2.6z" />
+              </svg>
+            </span>
+            <span className="mt-0.5 text-[10px] font-bold uppercase tracking-wide text-indigo-950">3D</span>
+          </button>
+        </div>
+      )}
+
+      {pegDrag && (
+        <div
+          className="pointer-events-none fixed z-[3000] -translate-x-1/2 -translate-y-[90%]"
+          style={{ left: pegDrag.x, top: pegDrag.y }}
+        >
+          <div className="flex flex-col items-center">
+            <div className="flex h-12 w-12 items-center justify-center rounded-full border-[3px] border-white bg-amber-400 shadow-2xl">
+              <svg viewBox="0 0 24 24" className="h-7 w-7 text-slate-900" fill="currentColor">
+                <circle cx="12" cy="5" r="2.2" />
+                <path d="M12 8.2c-1.6 0-2.8 1.1-2.8 2.6v3.2l-1.5 5.2h1.7l1.3-4.4h.6l1.3 4.4h1.7l-1.5-5.2v-3.2c0-1.5-1.2-2.6-2.8-2.6z" />
+              </svg>
+            </div>
+            <div className="mt-1 h-2 w-2 rotate-45 bg-amber-400 shadow" />
+          </div>
+        </div>
+      )}
+
       {enable3dRoad && (
         <NanasaRoad3DModal
           open={show3dModal}
@@ -316,6 +478,9 @@ export default function ProjectsMap({
           inventoryLines={inventoryLines}
           pavementRecords={pavementRecords}
           pavementDate={pavementDate}
+          initialChainageKm={entry3d.chainageKm}
+          initialPathMode={entry3d.pathMode}
+          entryKey={entry3d.key}
         />
       )}
     </div>

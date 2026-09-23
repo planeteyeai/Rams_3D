@@ -258,3 +258,49 @@ export function laneBands(spec = ROAD_SPEC) {
     increasing: inc,
   }
 }
+
+/**
+ * Snap a map click/drop to the nearest median vertex and return chainage + carriageway side.
+ * +normal = RHS / Decreasing, −normal = LHS / Increasing.
+ * Returns null if farther than `maxDistM` from the corridor.
+ */
+export function snapLatLngToRoad(lat, lng, coords, minKm, maxKm, maxDistM = 150) {
+  if (lat == null || lng == null || !coords?.length) return null
+  const { points, origin } = projectToLocal(coords)
+  if (!points.length || !origin) return null
+  const loc = lngLatToLocal(lng, lat, origin)
+  const { cumDist, totalM } = polylineMetrics(points)
+  if (!totalM) return null
+
+  let bestI = 0
+  let bestD = Infinity
+  for (let i = 0; i < points.length; i++) {
+    const d = Math.hypot(points[i].x - loc.x, points[i].z - loc.z)
+    if (d < bestD) {
+      bestD = d
+      bestI = i
+    }
+  }
+  if (bestD > maxDistM) return null
+
+  const s = sampleAtDistance(points, cumDist[bestI])
+  const sideDot = (loc.x - s.x) * s.nx + (loc.z - s.z) * s.nz
+  const pathMode = Math.abs(sideDot) < 1.2 ? 'median' : sideDot >= 0 ? 'rhs' : 'lhs'
+  const span = maxKm - minKm || 1
+  const chainageKm = minKm + (cumDist[bestI] / totalM) * span
+  return {
+    chainageKm: Math.max(minKm, Math.min(maxKm, chainageKm)),
+    pathMode,
+    distM: bestD,
+    lat: points[bestI].lat,
+    lng: points[bestI].lng,
+  }
+}
+
+/** Scrubber t (0..1) for a chainage on a given path mode. */
+export function scrubTFromChainage(chainageKm, pathMode, minKm, maxKm) {
+  const span = maxKm - minKm || 1
+  const km = Math.max(minKm, Math.min(maxKm, Number(chainageKm) || minKm))
+  if (pathMode === 'rhs') return Math.max(0, Math.min(1, (maxKm - km) / span))
+  return Math.max(0, Math.min(1, (km - minKm) / span))
+}

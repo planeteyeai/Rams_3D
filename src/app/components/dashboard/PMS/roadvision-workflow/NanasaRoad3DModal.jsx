@@ -69,11 +69,29 @@ function iriBandLabel(band) {
   return band === 'good' ? 'Good' : band === 'fair' ? 'Fair' : band === 'poor' ? 'Poor' : 'N/A'
 }
 
-/** 10 m chainage bin: e.g. 103.274 → [103.27, 103.28). */
-function tenMeterWindow(km) {
-  const start = Math.floor(Number(km) * 100 + 1e-9) / 100
-  return { start, end: Math.round((start + 0.01) * 100) / 100 }
+/** Chainage bin of `lengthM` metres: e.g. 10 → [103.27, 103.28), 100 → [103.2, 103.3). */
+function chainageWindow(km, lengthM = 10) {
+  const lenKm = Math.max(10, Number(lengthM) || 10) / 1000
+  const startRaw = Math.floor(Number(km) / lenKm + 1e-9) * lenKm
+  const endRaw = startRaw + lenKm
+  const decimals = lenKm >= 1 ? 0 : lenKm >= 0.1 ? 1 : 2
+  const round = (n) => Math.round(n * 10 ** decimals) / 10 ** decimals
+  return { start: round(startRaw), end: round(endRaw), lengthM: Math.round(lenKm * 1000) }
 }
+
+function formatWindowKm(n, lengthM) {
+  if (lengthM >= 1000) return Number(n).toFixed(0)
+  if (lengthM >= 100) return Number(n).toFixed(1)
+  return Number(n).toFixed(2)
+}
+
+const WINDOW_LENGTH_OPTIONS = [
+  { m: 10, label: '10 m' },
+  { m: 50, label: '50 m' },
+  { m: 100, label: '100 m' },
+  { m: 500, label: '500 m' },
+  { m: 1000, label: '1 km' },
+]
 
 function overlapsKm(a0, a1, b0, b1) {
   return Number(a0) < Number(b1) && Number(a1) > Number(b0)
@@ -1789,6 +1807,9 @@ export default function NanasaRoad3DModal({
   inventoryLines = NONE,
   pavementRecords = NONE,
   pavementDate: pavementDateProp = '',
+  initialChainageKm = null,
+  initialPathMode = null,
+  entryKey = 0,
 }) {
   const host = useRef(null)
   const runtime = useRef(null)
@@ -1868,12 +1889,14 @@ export default function NanasaRoad3DModal({
   const [selectedReported, setSelectedReported] = useState(null)
   const [playing, setPlaying] = useState(false)
   const [chromeMode, setChromeMode] = useState('normal') // normal | fullscreen | minimized
+  const [windowLengthM, setWindowLengthM] = useState(10) // cards + highlight patch length
   const shellRef = useRef(null)
 
   const playingRef = useRef(false)
   const scrubTRef = useRef(0)
   const pathModeRef = useRef('lhs')
   const followRef = useRef(true)
+  const windowLengthRef = useRef(10)
   const scrubRef = useRef({
     mode: 'lhs',
     t: 0,
@@ -1899,6 +1922,30 @@ export default function NanasaRoad3DModal({
   useEffect(() => {
     followRef.current = followScrubber
   }, [followScrubber])
+
+  useEffect(() => {
+    windowLengthRef.current = windowLengthM
+  }, [windowLengthM])
+
+  // Jump to map drop / entry point when opened or re-dropped
+  useEffect(() => {
+    if (!open) return
+    const mode = initialPathMode === 'lhs' || initialPathMode === 'rhs' || initialPathMode === 'median'
+      ? initialPathMode
+      : null
+    if (mode) setPathMode(mode)
+    if (Number.isFinite(Number(initialChainageKm))) {
+      const span = CHAINAGE_MAX_KM - CHAINAGE_MIN_KM || 1
+      const km = Math.max(CHAINAGE_MIN_KM, Math.min(CHAINAGE_MAX_KM, Number(initialChainageKm)))
+      const m = mode || pathModeRef.current || 'lhs'
+      const t = m === 'rhs'
+        ? (CHAINAGE_MAX_KM - km) / span
+        : (km - CHAINAGE_MIN_KM) / span
+      setScrubT(Math.max(0, Math.min(1, t)))
+      setFollowScrubber(true)
+      setPlaying(false)
+    }
+  }, [open, entryKey, initialChainageKm, initialPathMode]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!open) {
@@ -1996,7 +2043,7 @@ export default function NanasaRoad3DModal({
 
   const chainageSlice = useMemo(() => {
     const km = scrubToChainage(pathMode, scrubT)
-    const { start: winStart, end: winEnd } = tenMeterWindow(km)
+    const { start: winStart, end: winEnd } = chainageWindow(km, windowLengthM)
     const want = pathModeSideSign(pathMode)
     const { points: medianPts, origin } = corridor
 
@@ -2050,6 +2097,7 @@ export default function NanasaRoad3DModal({
       km,
       winStart,
       winEnd,
+      windowLengthM,
       pavement,
       reported,
       predicted,
@@ -2059,6 +2107,7 @@ export default function NanasaRoad3DModal({
   }, [
     pathMode,
     scrubT,
+    windowLengthM,
     scrubToChainage,
     corridor,
     pmsRecords,
@@ -2086,6 +2135,15 @@ export default function NanasaRoad3DModal({
       mode,
       mode === 'median' ? 0 : SCRUBBER_SHOULDER_M,
     )
+    // Camera rides the centre of the active carriageway (not median, not outer shoulder)
+    const camSample = sampleChainageShoulder(
+      rt.points,
+      chainageKm,
+      CHAINAGE_MIN_KM,
+      CHAINAGE_MAX_KM,
+      mode,
+      mode === 'median' ? 0 : DISTRESS_LANE_M,
+    )
 
     const markers = {
       lhs: rt.lhsMarker,
@@ -2103,20 +2161,25 @@ export default function NanasaRoad3DModal({
       active.visible = true
     }
 
-    // Highlight the same 10 m bin shown in the info cards (rebuild only when bin/mode changes)
-    const win = tenMeterWindow(chainageKm)
-    if (rt.chainageHighlight && (sr._hlStart !== win.start || sr._hlEnd !== win.end || sr._hlMode !== mode)) {
+    // Highlight the same chainage window shown in the info cards
+    const lenM = windowLengthRef.current
+    const win = chainageWindow(chainageKm, lenM)
+    if (
+      rt.chainageHighlight &&
+      (sr._hlStart !== win.start || sr._hlEnd !== win.end || sr._hlMode !== mode || sr._hlLen !== lenM)
+    ) {
       sr._hlStart = win.start
       sr._hlEnd = win.end
       sr._hlMode = mode
+      sr._hlLen = lenM
       updateChainageHighlight(rt.chainageHighlight, rt.points, win.start, win.end, mode)
     }
 
-    const backX = -Math.sin(sample.yaw)
-    const backZ = -Math.cos(sample.yaw)
-    sr.lookAt.set(sample.x, 1.2, sample.z)
-    // Lower, flatter TPP chase — less top-down, more horizontal
-    sr.camPos.set(sample.x + backX * 28, 7.5, sample.z + backZ * 28)
+    const backX = -Math.sin(camSample.yaw)
+    const backZ = -Math.cos(camSample.yaw)
+    sr.lookAt.set(camSample.x, 1.0, camSample.z)
+    // Slightly lower chase — still readable, not ground-level
+    sr.camPos.set(camSample.x + backX * 22, 5.0, camSample.z + backZ * 22)
     // Move sun less often — shadow map updates are expensive
     sr._sunTick = (sr._sunTick || 0) + 1
     if (rt.sun && (sr._sunTick % 8 === 0 || !sr.ready)) {
@@ -2170,7 +2233,7 @@ export default function NanasaRoad3DModal({
     // While playing, RAF owns scrub sync — avoid double updates from scrubT state
     if (playingRef.current) return
     syncScrubTargets(pathMode, scrubT, followScrubber)
-  }, [open, pathMode, scrubT, followScrubber, syncScrubTargets])
+  }, [open, pathMode, scrubT, followScrubber, windowLengthM, syncScrubTargets])
 
   useEffect(() => {
     if (!open || !host.current) return
@@ -2403,11 +2466,11 @@ export default function NanasaRoad3DModal({
     setPlaying(true)
   }
 
-  /** Step along path: +1 forward, −1 backward (10 m per click). */
+  /** Step along path by the selected window length. */
   const stepScrub = (dir) => {
     setPlaying(false)
     const span = CHAINAGE_MAX_KM - CHAINAGE_MIN_KM || 1
-    const delta = (0.01 / span) * dir // 10 m = 0.01 km
+    const delta = (windowLengthM / 1000 / span) * dir
     setScrubT((t) => Math.max(0, Math.min(1, t + delta)))
   }
 
@@ -2553,17 +2616,53 @@ export default function NanasaRoad3DModal({
         ) : (
         <>
         <div className="pointer-events-none absolute left-1/2 top-3 z-20 -translate-x-1/2">
-          <div className="rounded-full border border-white/20 bg-black/45 px-5 py-2 text-center shadow-xl backdrop-blur">
-            <p className="m-0 text-[13px] font-semibold uppercase tracking-[0.14em] text-slate-300">Chainage</p>
-            <p className="m-0 text-[26px] font-semibold tabular-nums leading-tight text-white">
-              Ch {chainageSlice.winStart.toFixed(2)} – {chainageSlice.winEnd.toFixed(2)} km
-            </p>
+          <div className="pointer-events-auto flex items-center gap-2 rounded-full border border-white/20 bg-black/45 px-2 py-1.5 shadow-xl backdrop-blur sm:gap-2.5 sm:px-3 sm:py-2">
+            <button
+              type="button"
+              onClick={() => stepScrub(-1)}
+              title={`Back ${windowLengthM >= 1000 ? '1 km' : `${windowLengthM} m`}`}
+              aria-label="Move chainage backward"
+              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-white/20 bg-white/10 text-white hover:bg-white/20"
+            >
+              <span aria-hidden className="text-[15px] leading-none">◀</span>
+            </button>
+            <div className="min-w-0 px-1 text-center sm:px-2">
+              <p className="m-0 text-[12px] font-semibold uppercase tracking-[0.14em] text-slate-300 sm:text-[13px]">Chainage</p>
+              <p className="m-0 text-[18px] font-semibold tabular-nums leading-tight text-white sm:text-[24px]">
+                Ch {formatWindowKm(chainageSlice.winStart, windowLengthM)} – {formatWindowKm(chainageSlice.winEnd, windowLengthM)} km
+              </p>
+            </div>
+            <label className="flex shrink-0 flex-col items-stretch gap-0.5">
+              <span className="text-[9px] font-semibold uppercase tracking-wide text-slate-400">Length</span>
+              <select
+                value={windowLengthM}
+                onChange={(e) => setWindowLengthM(Number(e.target.value))}
+                className="h-8 rounded-lg border border-white/20 bg-black/50 px-1.5 text-[11px] font-semibold text-white outline-none hover:bg-black/70"
+                title="Chainage window length for cards"
+                aria-label="Chainage window length"
+              >
+                {WINDOW_LENGTH_OPTIONS.map((opt) => (
+                  <option key={opt.m} value={opt.m}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              type="button"
+              onClick={() => stepScrub(1)}
+              title={`Forward ${windowLengthM >= 1000 ? '1 km' : `${windowLengthM} m`}`}
+              aria-label="Move chainage forward"
+              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-white/20 bg-white/10 text-white hover:bg-white/20"
+            >
+              <span aria-hidden className="text-[15px] leading-none">▶</span>
+            </button>
           </div>
         </div>
-        <div className="pointer-events-none absolute left-3 top-3 z-20 flex max-h-[calc(100%-8rem)] w-[min(520px,calc(100%-5.5rem))] flex-col gap-2 overflow-hidden">
+        <div className="pointer-events-none absolute left-3 top-3 z-20 flex max-h-[calc(100%-8rem)] w-[min(280px,calc(100%-5.5rem))] flex-col gap-2 overflow-hidden">
           <div className="pointer-events-auto flex min-h-0 flex-col gap-2 overflow-hidden">
-            {/* 2×2 cards */}
-            <div className="grid min-h-0 grid-cols-2 gap-2 overflow-hidden">
+            {/* Vertical cards */}
+            <div className="flex min-h-0 flex-col gap-2 overflow-y-auto overflow-x-hidden">
               {/* Pavement */}
               <div className="min-h-0 overflow-hidden rounded-2xl border border-slate-700/45 bg-transparent p-2.5">
                 <div className="mb-1.5 flex items-center gap-1.5">
@@ -2881,42 +2980,6 @@ export default function NanasaRoad3DModal({
           </div>
         )}
         <div className="pointer-events-none absolute inset-0 z-10 flex flex-col justify-end gap-1.5 p-2">
-          <div className="pointer-events-none flex max-w-[min(100%,48rem)] flex-wrap gap-1.5">
-            {[
-              { c: '#2a2e35', t: 'Decreasing' },
-              { c: '#4a7c59', t: 'Median' },
-              { c: '#353a42', t: 'Increasing' },
-              ...(reportedRecords.length
-                ? [
-                    { c: '#22c55e', t: 'Rep Low' },
-                    { c: '#FACC15', t: 'Rep Med' },
-                    { c: '#ef4444', t: 'Rep High' },
-                  ]
-                : []),
-              ...(predictedRecords.length
-                ? [
-                    { c: '#38bdf8', t: 'Pred Low' },
-                    { c: '#a78bfa', t: 'Pred Med' },
-                    { c: '#f472b6', t: 'Pred High' },
-                  ]
-                : []),
-              ...(invPoints.length || invLines.length
-                ? [
-                    { c: '#4CAF50', t: 'Trees' },
-                    { c: '#FFC107', t: 'Lights' },
-                    { c: '#F44336', t: 'Toll' },
-                    { c: '#3F51B5', t: 'Fuel' },
-                    { c: '#EA580C', t: 'Barrier' },
-                    { c: '#78909C', t: 'Kerb' },
-                  ]
-                : []),
-            ].map((x) => (
-              <span key={x.t} className="inline-flex items-center gap-1 rounded-full bg-black/45 px-2 py-0.5 text-[10px] font-medium text-white backdrop-blur">
-                <i className="inline-block h-2 w-2 rounded-sm" style={{ background: x.c }} />
-                {x.t}
-              </span>
-            ))}
-          </div>
           <div className="pointer-events-auto flex w-full items-center gap-2 rounded-xl border border-white/15 bg-[#0f172a]/90 px-2.5 py-1.5 shadow-xl backdrop-blur sm:gap-3 sm:px-3 sm:py-2">
             <select
               value={pathMode}
@@ -2933,7 +2996,7 @@ export default function NanasaRoad3DModal({
                 type="button"
                 onClick={() => stepScrub(-1)}
                 className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-white/15 bg-white/10 text-white hover:bg-white/20"
-                title="Back 10 m"
+                title={`Back ${windowLengthM >= 1000 ? '1 km' : `${windowLengthM} m`}`}
                 aria-label="Move backward"
               >
                 <span aria-hidden className="text-[13px] leading-none">◀</span>
@@ -2958,7 +3021,7 @@ export default function NanasaRoad3DModal({
                 type="button"
                 onClick={() => stepScrub(1)}
                 className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-white/15 bg-white/10 text-white hover:bg-white/20"
-                title="Forward 10 m"
+                title={`Forward ${windowLengthM >= 1000 ? '1 km' : `${windowLengthM} m`}`}
                 aria-label="Move forward"
               >
                 <span aria-hidden className="text-[13px] leading-none">▶</span>
