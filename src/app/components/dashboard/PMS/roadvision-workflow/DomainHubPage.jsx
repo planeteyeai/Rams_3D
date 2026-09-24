@@ -2,7 +2,7 @@ import { Navigate, useNavigate } from 'react-router-dom'
 import WorkflowShell from './WorkflowShell'
 import NodeCard from './NodeCard'
 import { GraphLayout } from './ConnectorLayouts'
-import { IconBituminous, IconConcrete, IconInventory, IconPms, IconRoad } from './Icons'
+import { IconBituminous, IconConcrete, IconInventory, IconPms, IconRoad, IconTraffic } from './Icons'
 import { setStoredPavementType, useWorkflow } from './constants'
 
 export default function DomainHubPage() {
@@ -13,7 +13,7 @@ export default function DomainHubPage() {
 
   return (
     <WorkflowShell crumbs={[{ label: 'Projects', to: '/' }, { label: project.name }]} backTo="/" backLabel="Back to projects" eyebrow="Domain hub" title={project.name} description="Inventory and PMS branch from the project. Bituminous and Concrete connect from the PMS card.">
-      <GraphLayout className="relative flex h-full min-h-0 items-center justify-center gap-10 overflow-hidden" links={[['project', 'inventory'], ['project', 'pms'], ['pms', 'bituminous'], ['pms', 'concrete']]}>
+      <GraphLayout className="relative flex h-full min-h-0 items-center justify-center gap-10 overflow-hidden" links={[['project', 'inventory'], ['project', 'pms'], ['project', 'traffic'], ['pms', 'bituminous'], ['pms', 'concrete']]}>
         {(bind) => (
           <>
             <div ref={bind('project')} className="relative z-[1] w-fit self-center">
@@ -35,6 +35,9 @@ export default function DomainHubPage() {
                     <NodeCard icon={<IconConcrete />} title="Concrete" subtitle="Rigid pavement" size="sm" hint="Open →" onClick={() => pick('concrete')} />
                   </div>
                 </div>
+              </div>
+              <div ref={bind('traffic')} className="relative z-[1] w-fit">
+                <NodeCard icon={<IconTraffic />} title="Traffic (AADT)" subtitle="AADT and PCU calculator" accent="violet" size="sm" hint="Open →" onClick={() => nav(`${base}/traffic`)} />
               </div>
             </div>
           </>

@@ -6,6 +6,7 @@ import medianData from '../../../../../assets/data/nanasa-median.json'
 import reportedData from '../../../../../assets/data/adani-reported.json'
 import predictedData from '../../../../../assets/data/adani-predicted.json'
 import pmsData from '../../../../../assets/data/adani-pms.json'
+import serviceRoadData from '../../../../../assets/data/nanasa-service-roads.json'
 import {
   buildDashedRibbon,
   buildRibbonGeometry,
@@ -291,7 +292,8 @@ function addPavementIri(root, medianPts, origin, records) {
 function applyPavementFilter(layer, filter, concreteLayer) {
   const mode = filter || 'all'
   const off = mode === 'off'
-  if (concreteLayer) concreteLayer.visible = !off
+  // Concrete is the road surface material, not an IRI overlay — always shown
+  if (concreteLayer) concreteLayer.visible = true
   if (!layer) return
   if (off) {
     layer.visible = false
@@ -591,12 +593,13 @@ function updateChainageHighlight(layer, medianPts, winStart, winEnd, mode) {
 }
 
 const ASPHALT = 0x2b2d31
-const CONCRETE = 0x8e949c
+const CONCRETE = 0xd9d6ce
 const SHOULDER = 0x4a453d
 const MEDIAN_GRASS = 0x3a6b3e
 const MEDIAN_SOIL = 0x5c4a32
 const MARK_WHITE = 0xf2f4f7
 const MARK_YELLOW = 0xf5d76e
+const CONCRETE_MARK = 0xe0a100
 const KERB = 0xc5cbd3
 const NONE = []
 
@@ -659,19 +662,61 @@ function grassMap() {
 
 function concreteMap() {
   return canvasTex((ctx, s) => {
-    ctx.fillStyle = '#8a9098'
+    // Weathered grey base (one texture tile = one lane width across)
+    ctx.fillStyle = '#b9b6ae'
     ctx.fillRect(0, 0, s, s)
-    for (let i = 0; i < 6000; i++) {
-      const n = 110 + Math.random() * 45
-      ctx.fillStyle = `rgba(${n},${n + 1},${n + 3},${0.15 + Math.random() * 0.35})`
-      ctx.fillRect(Math.random() * s, Math.random() * s, 1 + Math.random() * 2, 1 + Math.random() * 2)
-    }
-    ctx.strokeStyle = 'rgba(90,96,104,0.3)'
-    ctx.lineWidth = 1
-    for (let y = 0; y < s; y += 32) {
+    // Large soft tonal patches
+    for (let i = 0; i < 40; i++) {
+      const n = 160 + Math.random() * 45
+      ctx.fillStyle = `rgba(${n},${n - 2},${n - 8},${0.08 + Math.random() * 0.12})`
       ctx.beginPath()
-      ctx.moveTo(0, y + Math.random() * 4)
-      ctx.lineTo(s, y + Math.random() * 4)
+      ctx.ellipse(Math.random() * s, Math.random() * s, 10 + Math.random() * 40, 6 + Math.random() * 30, Math.random() * Math.PI, 0, Math.PI * 2)
+      ctx.fill()
+    }
+    // Aggregate speckle
+    for (let i = 0; i < 9000; i++) {
+      const n = 120 + Math.random() * 100
+      ctx.fillStyle = `rgba(${n},${n - 1},${n - 6},${0.12 + Math.random() * 0.3})`
+      ctx.fillRect(Math.random() * s, Math.random() * s, 1 + Math.random() * 1.6, 1 + Math.random() * 1.6)
+    }
+    // Wheel-path darkening
+    ;[0.27, 0.73].forEach((cx) => {
+      const g = ctx.createLinearGradient((cx - 0.1) * s, 0, (cx + 0.1) * s, 0)
+      g.addColorStop(0, 'rgba(70,68,64,0)')
+      g.addColorStop(0.5, 'rgba(70,68,64,0.16)')
+      g.addColorStop(1, 'rgba(70,68,64,0)')
+      ctx.fillStyle = g
+      ctx.fillRect((cx - 0.1) * s, 0, 0.2 * s, s)
+    })
+    // Oil / water stains
+    for (let i = 0; i < 6; i++) {
+      ctx.fillStyle = `rgba(60,58,55,${0.05 + Math.random() * 0.07})`
+      ctx.beginPath()
+      ctx.ellipse(Math.random() * s, Math.random() * s, 4 + Math.random() * 10, 8 + Math.random() * 18, 0, 0, Math.PI * 2)
+      ctx.fill()
+    }
+    // Longitudinal joint at lane edge + transverse slab joints (sealant dark line + light chamfer)
+    ctx.fillStyle = 'rgba(55,55,52,0.55)'
+    ctx.fillRect(0, 0, 1.5, s)
+    for (let y = 0; y < s; y += 64) {
+      ctx.fillStyle = 'rgba(55,55,52,0.6)'
+      ctx.fillRect(0, y, s, 1.5)
+      ctx.fillStyle = 'rgba(230,228,222,0.35)'
+      ctx.fillRect(0, y + 1.5, s, 1)
+    }
+    // Hairline cracks
+    ctx.strokeStyle = 'rgba(70,68,64,0.35)'
+    ctx.lineWidth = 0.7
+    for (let i = 0; i < 5; i++) {
+      let x = Math.random() * s
+      let y = Math.random() * s
+      ctx.beginPath()
+      ctx.moveTo(x, y)
+      for (let k = 0; k < 6; k++) {
+        x += (Math.random() - 0.5) * 14
+        y += 4 + Math.random() * 8
+        ctx.lineTo(x, y)
+      }
       ctx.stroke()
     }
   }, 256, 2, 40)
@@ -734,7 +779,7 @@ function addConcretePavementSurfaces(root, medianPts, origin, records) {
   const w = ROAD_SPEC.laneWidthM
   const outer = half + w * 2
   const concrete = concreteMap()
-  const concMat = { map: concrete, roughness: 0.9, metalness: 0.02 }
+  const concMat = { map: concrete, roughness: 0.93, metalness: 0.0 }
 
   const items = []
   records.forEach((r) => {
@@ -788,13 +833,13 @@ function addConcretePavementSurfaces(root, medianPts, origin, records) {
       layer.add(slab)
     }
 
-    // Yellow markings (edge + lane centre) instead of white
+    // Deeper yellow markings (edge + lane centre) so they read on the pale slab
     const edge = run.side >= 0 ? outer : -outer
     const lane = run.side >= 0 ? half + w : -(half + w)
     const pts = frames.map((f) => ({ x: f.x, z: f.z }))
-    addRibbon(layer, pts, edge - 0.08, edge + 0.08, 0.065, MARK_YELLOW, { roughness: 0.4, metalness: 0.06 })
-    addRibbon(layer, pts, (run.side >= 0 ? half : -half) + (run.side >= 0 ? 0.02 : -0.12), (run.side >= 0 ? half : -half) + (run.side >= 0 ? 0.12 : -0.02), 0.066, MARK_YELLOW, { roughness: 0.4, metalness: 0.06 })
-    addDashes(layer, pts, lane - 0.08, lane + 0.08, 0.08, MARK_YELLOW)
+    addRibbon(layer, pts, edge - 0.08, edge + 0.08, 0.065, CONCRETE_MARK, { roughness: 0.4, metalness: 0.06 })
+    addRibbon(layer, pts, (run.side >= 0 ? half : -half) + (run.side >= 0 ? 0.02 : -0.12), (run.side >= 0 ? half : -half) + (run.side >= 0 ? 0.12 : -0.02), 0.066, CONCRETE_MARK, { roughness: 0.4, metalness: 0.06 })
+    addDashes(layer, pts, lane - 0.08, lane + 0.08, 0.08, CONCRETE_MARK)
   })
   root.add(layer)
   return layer
@@ -1015,7 +1060,52 @@ function hash01(i, salt = 1) {
   return x - Math.floor(x)
 }
 
-function addTrees(root, list, origin) {
+/** Canopy clearance (m) so crowns don't overhang asphalt or shoulders. */
+const TREE_CLEAR_M = 2.2
+
+function hasServiceRoadAt(km, side) {
+  return SERVICE_SEGMENTS.some(
+    (s) =>
+      dirSideSign(s.dir) === side &&
+      km >= Number(s.start) - SERVICE_SLIP_KM &&
+      km <= Number(s.end) + SERVICE_SLIP_KM,
+  )
+}
+
+/**
+ * Keep GPS side + along-road position, but move the tree laterally off every paved strip:
+ * outside main shoulder/barrier, and beyond the service road (incl. slips) where one exists.
+ */
+function placeTreeOffRoad(p, i, origin, medianPts) {
+  const loc = lngLatToLocal(p.lng, p.lat, origin)
+  if (!medianPts?.length) return loc
+  let best = 0
+  let bestD = Infinity
+  for (let k = 0; k < medianPts.length; k++) {
+    const d = (medianPts[k].x - loc.x) ** 2 + (medianPts[k].z - loc.z) ** 2
+    if (d < bestD) {
+      bestD = d
+      best = k
+    }
+  }
+  const f = nearestMedianFrame(loc, medianPts)
+  const lateral = (loc.x - f.x) * f.nx + (loc.z - f.z) * f.nz
+  const side = Math.abs(lateral) < 2 ? dirSideSign(p.dir) : lateral >= 0 ? SIDE_RHS : SIDE_LHS
+  const { cumDist, totalM } = cumulativeFor(medianPts)
+  const km = CHAINAGE_MIN_KM + (cumDist[best] / (totalM || 1)) * (CHAINAGE_MAX_KM - CHAINAGE_MIN_KM)
+
+  const mainClear = KERB_EDGE_M + 1.7 + TREE_CLEAR_M
+  const serviceClear = SERVICE_ROAD_CENTRE_M + SERVICE_ROAD_WIDTH_M / 2 + 1 + TREE_CLEAR_M
+  const minOff = hasServiceRoadAt(km, side) ? serviceClear : mainClear
+  let off = Math.abs(lateral)
+  if (off < minOff) off = minOff + hash01(i, 21) * 5
+  return {
+    x: f.x + f.nx * off * side + f.tx * (hash01(i, 23) - 0.5) * 2,
+    z: f.z + f.nz * off * side + f.tz * (hash01(i, 23) - 0.5) * 2,
+  }
+}
+
+function addTrees(root, list, origin, medianPts) {
   if (!list?.length) return 0
   const count = list.length
   const dummy = new THREE.Object3D()
@@ -1043,7 +1133,7 @@ function addTrees(root, list, origin) {
   ]
 
   list.forEach((p, i) => {
-    const loc = lngLatToLocal(p.lng, p.lat, origin)
+    const loc = placeTreeOffRoad(p, i, origin, medianPts)
     const s = 0.78 + hash01(i, 1) * 0.55
     const yaw = hash01(i, 2) * Math.PI * 2
     dummy.position.set(loc.x, 0, loc.z)
@@ -1485,7 +1575,7 @@ function addInventoryPoints(root, items, origin, medianPts) {
       return
     }
     if (asset === 'Trees') {
-      n += addTrees(root, list, origin)
+      n += addTrees(root, list, origin, medianPts)
       return
     }
     if (asset === 'Toll Plaza') {
@@ -1636,6 +1726,69 @@ function shoulderLineFromChainage(medianPts, startKm, endKm, dir, offsetM, gpsHi
     tz: end.tz,
   })
   return out
+}
+
+/** Service road: 7 m two-lane strip beyond a grass verge outside the main shoulder. */
+const SERVICE_ROAD_WIDTH_M = 7
+const SERVICE_ROAD_CENTRE_M = KERB_EDGE_M + 1.7 + 6.5 + SERVICE_ROAD_WIDTH_M / 2
+const SERVICE_SLIP_KM = 0.06
+const SERVICE_SLIP_WIDTH_M = 5.5
+const SERVICE_SEGMENTS = serviceRoadData.segments || NONE
+
+/** Polyline along the median between two chainages with an offset that eases from offA to offB. */
+function offsetLineFromChainage(medianPts, startKm, endKm, sign, offA, offB) {
+  const span = CHAINAGE_MAX_KM - CHAINAGE_MIN_KM || 1
+  const { totalM } = polylineMetrics(medianPts)
+  const d0 = ((Math.max(CHAINAGE_MIN_KM, startKm) - CHAINAGE_MIN_KM) / span) * totalM
+  const d1 = ((Math.min(CHAINAGE_MAX_KM, endKm) - CHAINAGE_MIN_KM) / span) * totalM
+  if (!(d1 > d0)) return []
+  const out = []
+  const push = (d) => {
+    const s = sampleAtDistance(medianPts, d)
+    const u = (d - d0) / (d1 - d0)
+    const ease = u * u * (3 - 2 * u)
+    const off = (offA + (offB - offA) * ease) * sign
+    out.push({ x: s.x + s.nx * off, z: s.z + s.nz * off, tx: s.tx, tz: s.tz })
+  }
+  for (let d = d0; d < d1; d += 1.5) push(d)
+  push(d1)
+  return out
+}
+
+function addServiceRoads(root, segments, medianPts) {
+  if (!segments?.length || !medianPts?.length) return 0
+  const half = SERVICE_ROAD_WIDTH_M / 2
+  const slipHalf = SERVICE_SLIP_WIDTH_M / 2
+  const mainShoulderM = KERB_EDGE_M + 1.7
+  const asphaltMat = { map: asphaltMap(), roughness: 0.96, metalness: 0.02 }
+  let n = 0
+  segments.forEach((seg) => {
+    const start = Number(seg.start)
+    const end = Number(seg.end)
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return
+    const sign = corridorSideSign(seg.dir, null, medianPts)
+    const pts = offsetLineFromChainage(medianPts, start, end, sign, SERVICE_ROAD_CENTRE_M, SERVICE_ROAD_CENTRE_M)
+    if (pts.length < 2) return
+
+    addRibbon(root, pts, -(half + 1), half + 1, 0.025, SHOULDER, { roughness: 0.98, metalness: 0 })
+    addRibbon(root, pts, -half, half, 0.045, ASPHALT, asphaltMat)
+    addRibbon(root, pts, -half + 0.15, -half + 0.3, 0.052, MARK_WHITE, { roughness: 0.42, metalness: 0.04 })
+    addRibbon(root, pts, half - 0.3, half - 0.15, 0.052, MARK_WHITE, { roughness: 0.42, metalness: 0.04 })
+    addDashes(root, pts, -0.07, 0.07, 0.052, MARK_WHITE)
+
+    // Slip roads joining the main shoulder at both ends
+    const slips = [
+      offsetLineFromChainage(medianPts, start - SERVICE_SLIP_KM, start, sign, mainShoulderM + slipHalf, SERVICE_ROAD_CENTRE_M),
+      offsetLineFromChainage(medianPts, end, end + SERVICE_SLIP_KM, sign, SERVICE_ROAD_CENTRE_M, mainShoulderM + slipHalf),
+    ]
+    slips.forEach((slip) => {
+      if (slip.length < 2) return
+      addRibbon(root, slip, -(slipHalf + 0.6), slipHalf + 0.6, 0.024, SHOULDER, { roughness: 0.98, metalness: 0 })
+      addRibbon(root, slip, -slipHalf, slipHalf, 0.044, ASPHALT, asphaltMat)
+    })
+    n += 1
+  })
+  return n
 }
 
 /** Merge barrier inventory segments on the same side when chainage gap is small. */
@@ -1887,6 +2040,8 @@ export default function NanasaRoad3DModal({
   const [predictedFilter, setPredictedFilter] = useState('off') // off by default — heavy layer
   const [openLayerMenu, setOpenLayerMenu] = useState(null) // pavementDate | pavement | reported | predicted | null
   const [selectedReported, setSelectedReported] = useState(null)
+  const [focusedDistress, setFocusedDistress] = useState(null)
+  const [sceneLoading, setSceneLoading] = useState(true)
   const [playing, setPlaying] = useState(false)
   const [chromeMode, setChromeMode] = useState('normal') // normal | fullscreen | minimized
   const [windowLengthM, setWindowLengthM] = useState(10) // cards + highlight patch length
@@ -2085,6 +2240,21 @@ export default function NanasaRoad3DModal({
       (r) => overlapsKm(r.start, r.end ?? r.start, winStart, winEnd) && matchesPathDir(r.dir, pathMode),
     )
     const lineNames = [...new Set(invLn.map((r) => r.asset || r.name || 'Line'))]
+    // 3D bridges barrier gaps (mergeBarrierRuns), so list barriers wherever a merged run is drawn
+    const barrierLines = invLines.filter(
+      (r) => /barrier/i.test(r.asset || r.name || '') && matchesPathDir(r.dir, pathMode),
+    )
+    if (barrierLines.length && !lineNames.some((n) => /barrier/i.test(n))) {
+      const barrierName = barrierLines[0].asset || barrierLines[0].name || 'Crash Barrier'
+      const drawn = mergeBarrierRuns(barrierLines).some((run) =>
+        overlapsKm(run.start, run.end ?? run.start, winStart, winEnd),
+      )
+      if (drawn) lineNames.unshift(barrierName)
+    }
+    const onServiceRoad = SERVICE_SEGMENTS.some(
+      (s) => matchesPathDir(s.dir, pathMode) && overlapsKm(s.start, s.end, winStart, winEnd),
+    )
+    if (onServiceRoad && !lineNames.some((n) => /service/i.test(n))) lineNames.push('Service Road')
     const pointGroups = {}
     invPts.forEach((r) => {
       const key = `${r.asset || r.name || 'Asset'}|${r.dir || ''}`
@@ -2237,7 +2407,9 @@ export default function NanasaRoad3DModal({
 
   useEffect(() => {
     if (!open || !host.current) return
+    setSceneLoading(true)
 
+    const buildScene = () => {
     const el = host.current
     const scene = new THREE.Scene()
     scene.background = new THREE.Color(0xb9cfe3)
@@ -2314,6 +2486,7 @@ export default function NanasaRoad3DModal({
 
     const pointCount = addInventoryPoints(root, invPoints, origin, points)
     const lineCount = addInventoryLines(root, invLines, origin, points)
+    addServiceRoads(root, SERVICE_SEGMENTS, points)
     root.userData.invCounts = {
       pointCount,
       lineCount,
@@ -2347,7 +2520,8 @@ export default function NanasaRoad3DModal({
     scrubRef.current._hlStart = undefined
     scrubRef.current._hlEnd = undefined
     scrubRef.current._hlMode = undefined
-    syncScrubTargets(pathMode, scrubT, followScrubber)
+    // Refs, not closure state: build runs two frames late, after the peg-drop entry jump
+    syncScrubTargets(pathModeRef.current, scrubTRef.current, followRef.current)
 
     scene.add(root)
 
@@ -2368,6 +2542,7 @@ export default function NanasaRoad3DModal({
 
     let raf = 0
     let last = performance.now()
+    let firstFrame = true
     const tick = (now) => {
       raf = requestAnimationFrame(tick)
       const dt = Math.min(0.05, (now - last) / 1000)
@@ -2381,6 +2556,10 @@ export default function NanasaRoad3DModal({
       }
       controls.update()
       renderer.render(scene, camera)
+      if (firstFrame) {
+        firstFrame = false
+        setSceneLoading(false)
+      }
     }
     tick(performance.now())
 
@@ -2442,6 +2621,24 @@ export default function NanasaRoad3DModal({
       })
       if (renderer.domElement.parentNode === el) el.removeChild(renderer.domElement)
     }
+    }
+
+    // Heavy synchronous build — wait two frames so the loading overlay paints first
+    let cancelled = false
+    let dispose = null
+    let rafB = 0
+    const rafA = requestAnimationFrame(() => {
+      rafB = requestAnimationFrame(() => {
+        if (cancelled || !host.current) return
+        dispose = buildScene()
+      })
+    })
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(rafA)
+      cancelAnimationFrame(rafB)
+      dispose?.()
+    }
   }, [open, corridor, invPoints, invLines, pmsRecords, reportedRecords, predictedRecords])
 
   if (!open) return null
@@ -2464,6 +2661,27 @@ export default function NanasaRoad3DModal({
     if (scrubT >= 0.999) setScrubT(0)
     setFollowScrubber(true)
     setPlaying(true)
+  }
+
+  /** Fly the chase camera to a distress record (card click). */
+  const locateDistress = (rec, kind) => {
+    const s = Number(rec?.chainage_start)
+    if (!Number.isFinite(s)) return
+    const e = Number(rec.chainage_end)
+    const mid = Number.isFinite(e) && e > s ? (s + e) / 2 : s
+    const km = Math.max(CHAINAGE_MIN_KM, Math.min(CHAINAGE_MAX_KM, mid))
+    const span = CHAINAGE_MAX_KM - CHAINAGE_MIN_KM || 1
+    const t = pathMode === 'rhs' ? (CHAINAGE_MAX_KM - km) / span : (km - CHAINAGE_MIN_KM) / span
+    setPlaying(false)
+    setFollowScrubber(true)
+    setScrubT(Math.max(0, Math.min(1, t)))
+    setFocusedDistress(rec)
+    if (kind === 'reported') {
+      if (reportedFilter === 'off') setReportedFilter('all')
+      setSelectedReported(rec)
+    } else if (predictedFilter === 'off') {
+      setPredictedFilter('all')
+    }
   }
 
   /** Step along path by the selected window length. */
@@ -2543,6 +2761,25 @@ export default function NanasaRoad3DModal({
     <div ref={shellRef} className={shellClass}>
       <div className="relative min-h-0 flex-1">
         <div ref={host} className="absolute inset-0" />
+        <div
+          className={`pointer-events-none absolute inset-0 z-40 flex flex-col items-center justify-center gap-4 bg-gradient-to-b from-[#a8c6de] via-[#8fb3cf] to-[#4d7a4a] transition-opacity duration-500 ${sceneLoading ? 'opacity-100' : 'opacity-0'}`}
+          aria-hidden={!sceneLoading}
+        >
+          <div className="relative h-16 w-16">
+            <div className="absolute inset-0 rounded-full border-4 border-white/30" />
+            <div className="absolute inset-0 animate-spin rounded-full border-4 border-transparent border-t-white" />
+            <div className="absolute inset-3 flex items-center justify-center rounded-full bg-white/20 text-[11px] font-bold text-white">
+              3D
+            </div>
+          </div>
+          <div className="flex flex-col items-center gap-2 [text-shadow:0_1px_2px_rgba(0,0,0,0.6)]">
+            <p className="m-0 text-[14px] font-semibold text-white">Building 3D road view…</p>
+            <div className="h-1 w-40 overflow-hidden rounded-full bg-white/25">
+              <div className="h-full w-1/3 animate-[road3dLoad_1.1s_ease-in-out_infinite] rounded-full bg-white" />
+            </div>
+          </div>
+          <style>{'@keyframes road3dLoad{0%{transform:translateX(-100%)}100%{transform:translateX(300%)}}'}</style>
+        </div>
         <div className="pointer-events-auto absolute right-2 top-2 z-30 flex items-center gap-1">
           {!isMinimized && (
             <button
@@ -2615,34 +2852,34 @@ export default function NanasaRoad3DModal({
           </div>
         ) : (
         <>
-        <div className="pointer-events-none absolute left-1/2 top-3 z-20 -translate-x-1/2">
-          <div className="pointer-events-auto flex items-center gap-2 rounded-full border border-white/20 bg-black/45 px-2 py-1.5 shadow-xl backdrop-blur sm:gap-2.5 sm:px-3 sm:py-2">
+        <div className="pointer-events-none absolute left-1/2 top-10 z-20 -translate-x-1/2">
+          <div className="pointer-events-auto flex items-center gap-2 rounded-full bg-transparent px-2 py-1.5 [text-shadow:0_1px_2px_rgba(0,0,0,0.95),0_0_6px_rgba(0,0,0,0.75)] sm:gap-2.5 sm:px-3 sm:py-2">
             <button
               type="button"
               onClick={() => stepScrub(-1)}
               title={`Back ${windowLengthM >= 1000 ? '1 km' : `${windowLengthM} m`}`}
               aria-label="Move chainage backward"
-              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-white/20 bg-white/10 text-white hover:bg-white/20"
+              className="inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-full border border-white/40 bg-white/10 text-white hover:bg-white/20"
             >
-              <span aria-hidden className="text-[15px] leading-none">◀</span>
+              <span aria-hidden className="text-[22px] leading-none">◀</span>
             </button>
             <div className="min-w-0 px-1 text-center sm:px-2">
-              <p className="m-0 text-[12px] font-semibold uppercase tracking-[0.14em] text-slate-300 sm:text-[13px]">Chainage</p>
+              <p className="m-0 text-[12px] font-semibold uppercase tracking-[0.14em] text-slate-100 sm:text-[13px]">Chainage</p>
               <p className="m-0 text-[18px] font-semibold tabular-nums leading-tight text-white sm:text-[24px]">
                 Ch {formatWindowKm(chainageSlice.winStart, windowLengthM)} – {formatWindowKm(chainageSlice.winEnd, windowLengthM)} km
               </p>
             </div>
             <label className="flex shrink-0 flex-col items-stretch gap-0.5">
-              <span className="text-[9px] font-semibold uppercase tracking-wide text-slate-400">Length</span>
+              <span className="text-[9px] font-semibold uppercase tracking-wide text-slate-100">Length</span>
               <select
                 value={windowLengthM}
                 onChange={(e) => setWindowLengthM(Number(e.target.value))}
-                className="h-8 rounded-lg border border-white/20 bg-black/50 px-1.5 text-[11px] font-semibold text-white outline-none hover:bg-black/70"
+                className="h-8 rounded-lg border border-white/50 bg-transparent px-1.5 text-[11px] font-semibold text-white outline-none hover:bg-white/10 [&>option]:bg-slate-900 [&>option]:text-white"
                 title="Chainage window length for cards"
                 aria-label="Chainage window length"
               >
                 {WINDOW_LENGTH_OPTIONS.map((opt) => (
-                  <option key={opt.m} value={opt.m}>
+                  <option key={opt.m} value={opt.m} style={{ background: '#0f172a', color: '#fff' }}>
                     {opt.label}
                   </option>
                 ))}
@@ -2653,43 +2890,48 @@ export default function NanasaRoad3DModal({
               onClick={() => stepScrub(1)}
               title={`Forward ${windowLengthM >= 1000 ? '1 km' : `${windowLengthM} m`}`}
               aria-label="Move chainage forward"
-              className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-white/20 bg-white/10 text-white hover:bg-white/20"
+              className="inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-full border border-white/40 bg-white/10 text-white hover:bg-white/20"
             >
-              <span aria-hidden className="text-[15px] leading-none">▶</span>
+              <span aria-hidden className="text-[22px] leading-none">▶</span>
             </button>
           </div>
         </div>
         <div className="pointer-events-none absolute left-3 top-3 z-20 flex max-h-[calc(100%-8rem)] w-[min(280px,calc(100%-5.5rem))] flex-col gap-2 overflow-hidden">
           <div className="pointer-events-auto flex min-h-0 flex-col gap-2 overflow-hidden">
             {/* Vertical cards */}
-            <div className="flex min-h-0 flex-col gap-2 overflow-y-auto overflow-x-hidden">
+            <div className="flex min-h-0 flex-col gap-2 overflow-y-auto overflow-x-hidden pl-1 [direction:rtl] [&>*]:[direction:ltr] [scrollbar-width:thin] [scrollbar-color:rgba(255,255,255,0.45)_transparent] [text-shadow:0_1px_2px_rgba(0,0,0,0.95),0_0_6px_rgba(0,0,0,0.75)]">
               {/* Pavement */}
-              <div className="min-h-0 overflow-hidden rounded-2xl border border-slate-700/45 bg-transparent p-2.5">
+              <div className="shrink-0 rounded-2xl border border-slate-700/45 bg-transparent p-2.5">
                 <div className="mb-1.5 flex items-center gap-1.5">
-                  <span className="text-emerald-800" aria-hidden>
+                  <span className="text-emerald-300 drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)]" aria-hidden>
                     <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
                       <path d="M4 19V9 M10 19V5 M16 19v-7 M22 19V7" />
                     </svg>
                   </span>
-                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-emerald-800">
+                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-emerald-300">
                     Pavement score
                   </p>
+                  {chainageSlice.pavement.length > 0 && (
+                    <span className="shrink-0 rounded-full bg-black/40 px-1.5 text-[10px] font-bold text-white [text-shadow:none]">
+                      {chainageSlice.pavement.length}
+                    </span>
+                  )}
                 </div>
                 {chainageSlice.pavement.length === 0 ? (
                   <div className="flex min-h-[72px] flex-col items-center justify-center rounded-xl border border-dashed border-slate-700/45 px-2 text-center">
-                    <p className="m-0 text-[14px] font-semibold text-slate-900">No PMS data</p>
-                    <p className="mb-0 mt-0.5 text-[12px] text-slate-700">For this bin</p>
+                    <p className="m-0 text-[14px] font-semibold text-white">No PMS data</p>
+                    <p className="mb-0 mt-0.5 text-[12px] text-slate-100">For this bin</p>
                   </div>
                 ) : (
-                  <div className="flex flex-col gap-1.5">
-                    {chainageSlice.pavement.slice(0, 2).map((r, i) => {
+                  <div className="flex max-h-40 flex-col gap-1 overflow-y-auto pl-1 [direction:rtl] [&>*]:[direction:ltr] [scrollbar-width:thin]">
+                    {chainageSlice.pavement.map((r, i) => {
                       const band = iriBand(r)
                       return (
-                        <div key={`pms-${r.i ?? i}`} className="rounded-xl bg-transparent px-2 py-1.5">
+                        <div key={`pms-${r.i ?? i}`} className="shrink-0 rounded-xl bg-transparent px-2 py-1">
                           <div className="flex items-center justify-between gap-2">
-                            <span className="truncate text-[15px] font-semibold capitalize text-slate-900">{r.pavement || '—'}</span>
+                            <span className="truncate text-[15px] font-semibold capitalize text-white">{r.pavement || '—'}</span>
                             <span
-                              className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold"
+                              className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold [text-shadow:none]"
                               style={{
                                 background:
                                   band === 'good' ? '#111111' : band === 'fair' ? '#eab308' : band === 'poor' ? '#e2e8f0' : '#64748b',
@@ -2699,12 +2941,12 @@ export default function NanasaRoad3DModal({
                               {iriBandLabel(band)}
                             </span>
                           </div>
-                          <p className="mb-0 mt-0.5 truncate text-[12px] font-medium text-slate-700">
+                          <p className="mb-0 mt-0.5 truncate text-[12px] font-medium text-slate-100">
                             IRI {Number.isFinite(Number(r.iri)) ? Number(r.iri).toFixed(3) : '—'}
                             {r.pcs ? ` • PCS ${r.pcs}` : ''}
                           </p>
                           {r.iriStatus ? (
-                            <p className="mb-0 mt-0.5 line-clamp-1 text-[11px] leading-snug text-slate-700">{r.iriStatus}</p>
+                            <p className="mb-0 mt-0.5 line-clamp-1 text-[11px] leading-snug text-slate-200">{r.iriStatus}</p>
                           ) : null}
                         </div>
                       )
@@ -2714,33 +2956,44 @@ export default function NanasaRoad3DModal({
               </div>
 
               {/* Reported */}
-              <div className="min-h-0 overflow-hidden rounded-2xl border border-slate-700/45 bg-transparent p-2.5">
+              <div className="shrink-0 rounded-2xl border border-slate-700/45 bg-transparent p-2.5">
                 <div className="mb-1.5 flex items-center gap-1.5">
-                  <span className="text-amber-900" aria-hidden>
+                  <span className="text-amber-300 drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)]" aria-hidden>
                     <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
                       <path d="M12 3 L22 20 H2 Z" />
                       <path d="M12 9 v5 M12 17 h.01" />
                     </svg>
                   </span>
-                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-amber-900">
+                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-amber-300">
                     Reported distress
                   </p>
+                  {chainageSlice.reported.length > 0 && (
+                    <span className="shrink-0 rounded-full bg-black/40 px-1.5 text-[10px] font-bold text-white [text-shadow:none]">
+                      {chainageSlice.reported.length}
+                    </span>
+                  )}
                 </div>
                 {chainageSlice.reported.length === 0 ? (
                   <div className="flex min-h-[72px] flex-col items-center justify-center gap-1 rounded-xl border border-dashed border-slate-700/45 px-2 text-center">
-                    <p className="m-0 text-[14px] font-semibold text-slate-900">No distress reported</p>
-                    <p className="mb-0 text-[12px] text-slate-700">Looks good!</p>
+                    <p className="m-0 text-[14px] font-semibold text-white">No distress reported</p>
+                    <p className="mb-0 text-[12px] text-slate-100">Looks good!</p>
                   </div>
                 ) : (
-                  <div className="flex flex-col gap-1.5">
-                    {chainageSlice.reported.slice(0, 2).map((r, i) => (
-                      <div key={`rep-${i}`} className="rounded-xl bg-transparent px-2 py-1.5">
+                  <div className="flex max-h-40 flex-col gap-1 overflow-y-auto pl-1 [direction:rtl] [&>*]:[direction:ltr] [scrollbar-width:thin]">
+                    {chainageSlice.reported.map((r, i) => (
+                      <button
+                        type="button"
+                        key={`rep-${i}`}
+                        onClick={() => locateDistress(r, 'reported')}
+                        title="Locate in 3D"
+                        className={`block w-full shrink-0 cursor-pointer rounded-xl px-2 py-1 text-left transition hover:bg-white/15 ${focusedDistress === r ? 'bg-white/20 ring-1 ring-amber-300/80' : 'bg-transparent'}`}
+                      >
                         <div className="flex items-center justify-between gap-2">
-                          <span className="min-w-0 truncate text-[15px] font-semibold text-slate-900">
+                          <span className="min-w-0 truncate text-[15px] font-semibold text-white">
                             {r.distress_type || 'Distress'}
                           </span>
                           <span
-                            className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold text-slate-900"
+                            className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold text-slate-900 [text-shadow:none]"
                             style={{
                               background:
                                 r.severity === 'High' ? '#ef4444' : r.severity === 'Medium' ? '#eab308' : '#16a34a',
@@ -2750,45 +3003,57 @@ export default function NanasaRoad3DModal({
                             {r.severity || 'Low'}
                           </span>
                         </div>
-                        <p className="mb-0 mt-0.5 truncate text-[12px] font-medium text-amber-950">
+                        <p className="mb-0 mt-0.5 truncate text-[12px] font-medium text-amber-200">
                           {String(r.direction || '').toLowerCase().startsWith('dec') ? '↘' : '↗'}{' '}
                           {r.direction || '—'}
                           {r.area != null ? ` • ${Number(r.area).toFixed(2)} m²` : ''}
+                          {Number.isFinite(Number(r.chainage_start)) ? ` • Ch ${Number(r.chainage_start).toFixed(3)}` : ''}
                         </p>
-                      </div>
+                      </button>
                     ))}
                   </div>
                 )}
               </div>
 
               {/* Predicted */}
-              <div className="min-h-0 overflow-hidden rounded-2xl border border-slate-700/45 bg-transparent p-2.5">
+              <div className="shrink-0 rounded-2xl border border-slate-700/45 bg-transparent p-2.5">
                 <div className="mb-1.5 flex items-center gap-1.5">
-                  <span className="text-sky-900" aria-hidden>
+                  <span className="text-cyan-300 drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)]" aria-hidden>
                     <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
                       <path d="M3 17 L9 11 L13 15 L21 6" />
                       <path d="M16 6 h5 v5" />
                     </svg>
                   </span>
-                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-sky-900">
+                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-cyan-300">
                     Predicted distress
                   </p>
+                  {chainageSlice.predicted.length > 0 && (
+                    <span className="shrink-0 rounded-full bg-black/40 px-1.5 text-[10px] font-bold text-white [text-shadow:none]">
+                      {chainageSlice.predicted.length}
+                    </span>
+                  )}
                 </div>
                 {chainageSlice.predicted.length === 0 ? (
                   <div className="flex min-h-[72px] flex-col items-center justify-center rounded-xl border border-dashed border-slate-700/45 px-2 text-center">
-                    <p className="m-0 text-[14px] font-semibold text-slate-900">No prediction</p>
-                    <p className="mb-0 mt-0.5 text-[12px] text-slate-700">For this bin</p>
+                    <p className="m-0 text-[14px] font-semibold text-white">No prediction</p>
+                    <p className="mb-0 mt-0.5 text-[12px] text-slate-100">For this bin</p>
                   </div>
                 ) : (
-                  <div className="flex flex-col gap-1.5">
-                    {chainageSlice.predicted.slice(0, 2).map((r, i) => (
-                      <div key={`pred-${i}`} className="rounded-xl bg-transparent px-2 py-1.5">
+                  <div className="flex max-h-40 flex-col gap-1 overflow-y-auto pl-1 [direction:rtl] [&>*]:[direction:ltr] [scrollbar-width:thin]">
+                    {chainageSlice.predicted.map((r, i) => (
+                      <button
+                        type="button"
+                        key={`pred-${i}`}
+                        onClick={() => locateDistress(r, 'predicted')}
+                        title="Locate in 3D"
+                        className={`block w-full shrink-0 cursor-pointer rounded-xl px-2 py-1 text-left transition hover:bg-white/15 ${focusedDistress === r ? 'bg-white/20 ring-1 ring-cyan-300/80' : 'bg-transparent'}`}
+                      >
                         <div className="flex items-center justify-between gap-2">
-                          <span className="min-w-0 truncate text-[15px] font-semibold text-slate-900">
+                          <span className="min-w-0 truncate text-[15px] font-semibold text-white">
                             {r.distress_type || 'Distress'}
                           </span>
                           <span
-                            className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold text-slate-900"
+                            className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold text-slate-900 [text-shadow:none]"
                             style={{
                               background:
                                 r.severity === 'High' ? '#f472b6' : r.severity === 'Medium' ? '#a78bfa' : '#38bdf8',
@@ -2797,60 +3062,65 @@ export default function NanasaRoad3DModal({
                             {r.severity || 'Low'}
                           </span>
                         </div>
-                        <p className="mb-0 mt-0.5 truncate text-[12px] font-medium text-sky-950">
+                        <p className="mb-0 mt-0.5 truncate text-[12px] font-medium text-cyan-200">
                           {String(r.direction || '').toLowerCase().startsWith('dec') ? '↘' : '↗'}{' '}
                           {r.direction || '—'}
+                          {Number.isFinite(Number(r.chainage_start)) ? ` • Ch ${Number(r.chainage_start).toFixed(3)}` : ''}
                         </p>
-                      </div>
+                      </button>
                     ))}
                   </div>
                 )}
               </div>
 
               {/* Inventory */}
-              <div className="min-h-0 overflow-hidden rounded-2xl border border-slate-700/45 bg-transparent p-2.5">
+              <div className="shrink-0 rounded-2xl border border-slate-700/45 bg-transparent p-2.5">
                 <div className="mb-1.5 flex items-center gap-1.5">
-                  <span className="text-violet-900" aria-hidden>
+                  <span className="text-fuchsia-300 drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)]" aria-hidden>
                     <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
                       <path d="M12 3 L21 8 L12 13 L3 8 Z" />
                       <path d="M3 8 v8 l9 5 M21 8 v8 l-9 5 M12 13 v8" />
                     </svg>
                   </span>
-                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-violet-900">
+                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-fuchsia-300">
                     Inventory
                   </p>
+                  {chainageSlice.inventoryPoints.length + chainageSlice.inventoryLines.length > 0 && (
+                    <span className="shrink-0 rounded-full bg-black/40 px-1.5 text-[10px] font-bold text-white [text-shadow:none]">
+                      {chainageSlice.inventoryPoints.length + chainageSlice.inventoryLines.length}
+                    </span>
+                  )}
                 </div>
                 {chainageSlice.inventoryPoints.length === 0 && chainageSlice.inventoryLines.length === 0 ? (
                   <div className="flex min-h-[72px] flex-col items-center justify-center rounded-xl border border-dashed border-slate-700/45 px-2 text-center">
-                    <p className="m-0 text-[14px] font-semibold text-slate-900">No inventory</p>
-                    <p className="mb-0 mt-0.5 text-[12px] text-slate-700">In this bin</p>
+                    <p className="m-0 text-[14px] font-semibold text-white">No inventory</p>
+                    <p className="mb-0 mt-0.5 text-[12px] text-slate-100">In this bin</p>
                   </div>
                 ) : (
-                  <div className="flex flex-col gap-1.5">
+                  <div className="flex max-h-52 flex-col gap-1 overflow-y-auto pl-1 [direction:rtl] [&>*]:[direction:ltr] [scrollbar-width:thin]">
                     {[
-                      ...chainageSlice.inventoryPoints.map((g) => ({
-                        key: `pt-${g.asset}-${g.dir}`,
-                        title: g.asset,
-                        badge: `×${g.count}`,
-                        sub: g.dir || 'Point asset',
-                      })),
                       ...chainageSlice.inventoryLines.map((name) => ({
                         key: `line-${name}`,
                         title: name,
                         badge: 'Linear',
                         sub: 'Covers this chainage',
                       })),
+                      ...chainageSlice.inventoryPoints.map((g) => ({
+                        key: `pt-${g.asset}-${g.dir}`,
+                        title: g.asset,
+                        badge: `×${g.count}`,
+                        sub: g.dir || 'Point asset',
+                      })),
                     ]
-                      .slice(0, 3)
                       .map((item) => (
-                        <div key={item.key} className="rounded-xl bg-transparent px-2 py-1.5">
+                        <div key={item.key} className="shrink-0 rounded-xl bg-transparent px-2 py-1">
                           <div className="flex items-center justify-between gap-2">
-                            <span className="min-w-0 truncate text-[15px] font-semibold text-slate-900">{item.title}</span>
-                            <span className="shrink-0 rounded-full bg-slate-900/15 px-2 py-0.5 text-[11px] font-bold text-slate-900">
+                            <span className="min-w-0 truncate text-[15px] font-semibold text-white">{item.title}</span>
+                            <span className="shrink-0 rounded-full bg-black/55 px-2 py-0.5 text-[11px] font-bold text-white [text-shadow:none]">
                               {item.badge}
                             </span>
                           </div>
-                          <p className="mb-0 mt-0.5 truncate text-[12px] font-medium text-slate-700">{item.sub}</p>
+                          <p className="mb-0 mt-0.5 truncate text-[12px] font-medium text-slate-100">{item.sub}</p>
                         </div>
                       ))}
                   </div>
@@ -2984,12 +3254,12 @@ export default function NanasaRoad3DModal({
             <select
               value={pathMode}
               onChange={(e) => onPathChange(e.target.value)}
-              className="h-8 shrink-0 rounded-lg border border-white/15 bg-white/10 px-2 text-[12px] font-semibold text-white outline-none"
+              className="h-8 shrink-0 rounded-lg border border-white/15 bg-white/10 px-2 text-[12px] font-semibold text-white outline-none [&>option]:bg-slate-900 [&>option]:text-white"
               title="Path"
             >
-              <option value="median">Median</option>
-              <option value="lhs">LHS</option>
-              <option value="rhs">RHS</option>
+              <option value="median" style={{ background: '#0f172a', color: '#fff' }}>Median</option>
+              <option value="lhs" style={{ background: '#0f172a', color: '#fff' }}>LHS</option>
+              <option value="rhs" style={{ background: '#0f172a', color: '#fff' }}>RHS</option>
             </select>
             <div className="inline-flex shrink-0 items-center gap-1">
               <button

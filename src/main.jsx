@@ -9,6 +9,7 @@ import InventoryHubPage from './app/components/dashboard/PMS/roadvision-workflow
 import PmsHubPage from './app/components/dashboard/PMS/roadvision-workflow/PmsHubPage.jsx'
 import ProcessNodesPage from './app/components/dashboard/PMS/roadvision-workflow/ProcessNodesPage.jsx'
 import ConditionPlaceholderPage from './app/components/dashboard/PMS/roadvision-workflow/ConditionPlaceholderPage.jsx'
+import TrafficAadtPage from './app/components/dashboard/PMS/roadvision-workflow/TrafficAadtPage.jsx'
 import DashboardPlaceholder from './app/components/dashboard/RIS/DashboardPlaceholder.jsx'
 
 createRoot(document.getElementById('root')).render(
@@ -20,6 +21,7 @@ createRoot(document.getElementById('root')).render(
           <Route path="workflow/:projectId" element={<DomainHubPage />} />
           <Route path="workflow/:projectId/inventory" element={<InventoryHubPage />} />
           <Route path="workflow/:projectId/pms" element={<PmsHubPage />} />
+          <Route path="workflow/:projectId/traffic" element={<TrafficAadtPage />} />
           <Route
             path="workflow/:projectId/pms/:pavementType"
             element={<ProcessNodesPage />}

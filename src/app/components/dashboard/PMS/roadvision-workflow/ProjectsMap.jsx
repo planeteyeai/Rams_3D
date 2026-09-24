@@ -60,6 +60,9 @@ export default function ProjectsMap({
   const [entry3d, setEntry3d] = useState({ key: 0, chainageKm: null, pathMode: null })
   const [pegDrag, setPegDrag] = useState(null) // { x, y } viewport coords while dragging
   const [pegHint, setPegHint] = useState('')
+  const [cursorCoords, setCursorCoords] = useState(null) // { lat, lng }
+  const [coordsCopied, setCoordsCopied] = useState(false)
+  const coordsCopyTimer = useRef(null)
   const snapPreview = useRef(null)
   const pegActive = useRef(false)
   hover.current = onHover
@@ -153,19 +156,47 @@ export default function ProjectsMap({
     L.control.zoom({ position: 'topleft' }).addTo(m)
     const keepView = () => { userView.current = true }
     m.on('zoomstart dragstart', keepView)
+    const onMouseMove = (e) => {
+      const { lat, lng } = e.latlng
+      setCursorCoords({ lat, lng })
+    }
+    m.on('mousemove', onMouseMove)
     map.current = m
     const ro = new ResizeObserver(() => m.invalidateSize())
     ro.observe(wrap.current)
     const t = setTimeout(() => m.invalidateSize(), 150)
     return () => {
       clearTimeout(t)
+      clearTimeout(coordsCopyTimer.current)
       ro.disconnect()
       m.off('zoomstart dragstart', keepView)
+      m.off('mousemove', onMouseMove)
       clearRoad3d()
       m.remove()
       map.current = null
     }
   }, [])
+
+  const copyCursorCoords = async () => {
+    if (!cursorCoords) return
+    const text = `${cursorCoords.lat.toFixed(6)}, ${cursorCoords.lng.toFixed(6)}`
+    try {
+      await navigator.clipboard.writeText(text)
+    } catch {
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.setAttribute('readonly', '')
+      ta.style.position = 'fixed'
+      ta.style.left = '-9999px'
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    }
+    setCoordsCopied(true)
+    clearTimeout(coordsCopyTimer.current)
+    coordsCopyTimer.current = setTimeout(() => setCoordsCopied(false), 1500)
+  }
 
   useEffect(() => {
     const m = map.current
@@ -421,6 +452,26 @@ export default function ProjectsMap({
           </>
         )}
       </div>
+      )}
+
+      {!show3dModal && cursorCoords && (
+        <div className="absolute bottom-4 left-3 z-[1000] flex items-center gap-2 rounded-lg border border-white/80 bg-slate-900/90 px-2.5 py-1.5 shadow-lg backdrop-blur tabular-nums">
+          <div className="min-w-0">
+            <p className="m-0 text-[9px] font-semibold uppercase tracking-wide text-slate-400">Coordinates</p>
+            <p className="m-0 select-all text-[12px] font-semibold text-white">
+              {cursorCoords.lat.toFixed(6)}, {cursorCoords.lng.toFixed(6)}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={copyCursorCoords}
+            title="Copy coordinates"
+            aria-label="Copy coordinates"
+            className="shrink-0 rounded-md border border-white/20 bg-white/10 px-2 py-1 text-[10px] font-semibold text-white transition hover:bg-white/20"
+          >
+            {coordsCopied ? 'Copied' : 'Copy'}
+          </button>
+        </div>
       )}
 
       {/* Pegman-style control — left side so inventory panel does not cover it */}

@@ -17,6 +17,7 @@ export const IconBituminous = svg(<><path d="M3 16c2.5-3 5-3 7.5 0s5 3 7.5 0 5-3
 export const IconConcrete = svg(<><rect x="3" y="4" width="18" height="16" rx="1.5" /><path d="M3 12h18M12 4v16M7.5 4v16M16.5 4v16" /></>)
 export const IconCondition = svg(<><path d="M5 19a9 9 0 1 1 14 0" /><path d="M12 13v-2M12 19h.01m-2-9 4-3" /></>)
 export const IconReported = svg(<><path d="M8 3h8v4H8z" /><rect x="5" y="5" width="14" height="16" rx="2" /><path d="M9 12h6M9 16h4" /></>)
+export const IconTraffic = svg(<><rect x="4" y="9" width="16" height="7" rx="2" /><path d="M6 9 8 5h8l2 4" /><circle cx="8" cy="18" r="1.6" /><circle cx="16" cy="18" r="1.6" /></>)
 export const IconPredicted = svg(<><path d="M4 18 10 10l4 4 6-8M15 6h5v5" /></>)
 export const IconBack = svg(<path d="M15 6 9 12l6 6" />)
 export const IconChevron = svg(<path d="m9 6 6 6-6 6" />)
