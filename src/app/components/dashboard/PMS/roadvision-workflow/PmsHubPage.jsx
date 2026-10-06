@@ -107,19 +107,9 @@ export default function PmsHubPage() {
   const [date, setDate] = useState(pmsData.dates?.[0] || '')
   const [pavement, setPavement] = useState('all')
   const [band, setBand] = useState('all')
+  const [lane, setLane] = useState('all')
   const [activeId, setActiveId] = useState(null)
   const [hideHud, setHideHud] = useState(false)
-
-  const rows = useMemo(() => {
-    const name = project?.name
-    return pmsData.records.filter((r) => {
-      if (name && r.project !== name) return false
-      if (date && r.date !== date) return false
-      if (pavement !== 'all' && r.pavement !== pavement) return false
-      if (band !== 'all' && iriBand(r) !== band) return false
-      return true
-    })
-  }, [project, date, pavement, band])
 
   const corridor = useMemo(() => {
     const name = project?.name
@@ -127,14 +117,21 @@ export default function PmsHubPage() {
       if (name && r.project !== name) return false
       if (date && r.date !== date) return false
       if (pavement !== 'all' && r.pavement !== pavement) return false
+      if (lane !== 'all' && r.lane !== lane) return false
       return true
     })
-  }, [project, date, pavement])
+  }, [project, date, pavement, lane])
+
+  const rows = useMemo(
+    () => (band === 'all' ? corridor : corridor.filter((r) => iriBand(r) === band)),
+    [corridor, band],
+  )
 
   const segments = useMemo(() => rows.map((r) => {
     const from = r.from?.[0] && r.to?.[0] ? [[r.from[0], r.from[1]], [r.to[0], r.to[1]]] : [[r.lat, r.lng], [r.lat, r.lng]]
     const meta = iriMeta(iriBand(r))
-    return { id: String(r.i), latlngs: from, color: meta.color, ...r, name: `Ch ${r.start}–${r.end}`, place: meta.label }
+    const where = [r.direction, r.lane].filter(Boolean).join(' · ')
+    return { id: String(r.i), latlngs: from, color: meta.color, ...r, name: `Ch ${r.start}–${r.end}`, place: where ? `${meta.label} · ${where}` : meta.label }
   }), [rows])
 
   const inventoryPoints = useMemo(() => {
@@ -212,6 +209,12 @@ export default function PmsHubPage() {
               <option value="bituminous">Bituminous</option>
               <option value="concrete">Concrete</option>
             </select>
+            <select value={lane} onChange={(e) => setLane(e.target.value)} className="col-span-2 h-9 rounded-xl border border-indigo-100 bg-white px-2 text-[12px] text-indigo-950 outline-none">
+              <option value="all">All lanes</option>
+              {(pmsData.lanes || ['L1', 'L2']).map((l) => (
+                <option key={l} value={l}>{l === 'L1' ? 'L1 · median-side lane' : l === 'L2' ? 'L2 · outer lane' : l}</option>
+              ))}
+            </select>
           </div>
           <p className="mb-2 mt-0 shrink-0 text-[12px] text-slate-400">IRI condition · click to filter</p>
           <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden">
@@ -239,7 +242,7 @@ export default function PmsHubPage() {
           {active && (
             <div className="pointer-events-auto rounded-2xl border border-white/70 bg-white/95 px-3 py-2 shadow-lg backdrop-blur">
               <p className="m-0 text-[13px] font-semibold text-indigo-950">{active.name} km · {active.place}</p>
-              <p className="m-0 text-[12px] text-slate-500">{active.pavement} · IRI {active.iri != null ? Number(active.iri).toFixed(2) : '—'} · {active.date}</p>
+              <p className="m-0 text-[12px] text-slate-500">{active.pavement} · IRI {active.iri != null ? `${Math.round(Number(active.iri) * 1000)} mm/km` : '—'} · {active.date}</p>
             </div>
           )}
           <div className="pointer-events-auto w-full max-w-[720px]">

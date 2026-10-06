@@ -100,8 +100,8 @@ export default function InventoryHubPage() {
     ...r,
     id: String(r.i),
     color: colorOf(r.asset),
-    name: r.asset,
-    place: `${r.dir || '—'} · Ch ${r.start}–${r.end}`,
+    name: r.sub ? `${r.asset} (${r.sub})` : r.asset,
+    place: `${r.road === 'service' ? 'Service Rd · ' : ''}${r.dir || '—'} · Ch ${r.start}–${r.end}`,
   })), [rows])
 
   const segments = useMemo(() => lineRows.map((r) => ({
@@ -110,8 +110,8 @@ export default function InventoryHubPage() {
     color: colorOf(r.asset),
     weight: 4,
     opacity: 0.78,
-    name: r.asset,
-    place: `${r.dir || '—'} · Ch ${r.start}–${r.end}`,
+    name: r.sub ? `${r.asset} (${r.sub})` : r.asset,
+    place: `${r.road === 'service' ? 'Service Rd · ' : ''}${r.dir || '—'} · Ch ${r.start}–${r.end}`,
   })), [lineRows])
 
   const counts = useMemo(() => {
@@ -125,7 +125,7 @@ export default function InventoryHubPage() {
     })
     invData.lines.forEach((r) => {
       if (dir !== 'all' && r.dir !== dir) return
-      if (c[r.asset] != null) c[r.asset] += r.latlngs?.length || 1
+      if (c[r.asset] != null) c[r.asset] += r.n ?? (r.latlngs?.length || 1)
     })
     return c
   }, [project, date, dir])

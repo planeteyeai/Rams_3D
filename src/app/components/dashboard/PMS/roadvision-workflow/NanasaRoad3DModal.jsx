@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import L from 'leaflet'
+import 'leaflet/dist/leaflet.css'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js'
@@ -10,6 +12,7 @@ import serviceRoadData from '../../../../../assets/data/nanasa-service-roads.jso
 import {
   buildDashedRibbon,
   buildRibbonGeometry,
+  mergeRibbonGeometries,
   lngLatToLocal,
   polylineMetrics,
   projectToLocal,
@@ -249,40 +252,65 @@ function addPavementIri(root, medianPts, origin, records) {
       const f = nearestMedianFrame(loc, medianPts)
       side = (loc.x - f.x) * f.nx + (loc.z - f.z) * f.nz >= 0 ? SIDE_RHS : SIDE_LHS
     }
-    items.push({ start, end, side, band: iriBand(r) })
+    const lane = /^L[12]$/i.test(String(r.lane || '')) ? String(r.lane).toUpperCase() : ''
+    items.push({ start, end, side, lane, band: iriBand(r) })
   })
 
-  items.sort((a, b) => a.side - b.side || a.band.localeCompare(b.band) || a.start - b.start)
+  items.sort(
+    (a, b) =>
+      a.side - b.side || a.lane.localeCompare(b.lane) || a.band.localeCompare(b.band) || a.start - b.start,
+  )
   const runs = []
   items.forEach((it) => {
     const last = runs[runs.length - 1]
-    if (last && last.side === it.side && last.band === it.band && it.start <= last.end + 0.05) {
+    if (
+      last &&
+      last.side === it.side &&
+      last.lane === it.lane &&
+      last.band === it.band &&
+      it.start <= last.end + 0.05
+    ) {
       last.end = Math.max(last.end, it.end)
       return
     }
     runs.push({ ...it })
   })
 
+  const groups = new Map()
   runs.forEach((run) => {
-    // side: LHS (−1) → −outer..−half ; RHS (+1) → half..outer
-    const left = run.side >= 0 ? half : -outer
-    const right = run.side >= 0 ? outer : -half
-    const frames = sliceMedianFrames(medianPts, run.start, run.end, 2)
-    const color = IRI_COLORS[run.band] || IRI_COLORS.na
-    const mesh = makeMesh(buildRibbonFromFrames(frames, left, right, 0.055), color, {
+    // L1 is the median-side lane, L2 the outer lane; no lane → whole carriageway
+    let inner = half
+    let outerEdge = outer
+    if (run.lane === 'L1') outerEdge = half + ROAD_SPEC.laneWidthM
+    else if (run.lane === 'L2') inner = half + ROAD_SPEC.laneWidthM
+    const left = run.side >= 0 ? inner : -outerEdge
+    const right = run.side >= 0 ? outerEdge : -inner
+    const frames = sliceMedianFrames(medianPts, run.start, run.end, 4)
+    const geo = buildRibbonFromFrames(frames, left, right, 0.055)
+    if (!geo) return
+    const key = `${run.band}|${left}|${right}`
+    const bucket = groups.get(key)
+    if (bucket) bucket.push(geo)
+    else groups.set(key, [geo])
+  })
+
+  groups.forEach((geos, key) => {
+    const band = key.slice(0, key.indexOf('|'))
+    const color = IRI_COLORS[band] || IRI_COLORS.na
+    const mesh = makeMesh(mergeRibbonGeometries(geos), color, {
       roughness: 0.88,
       metalness: 0.04,
     })
     if (!mesh) return
     mesh.material.transparent = true
-    mesh.material.opacity = run.band === 'good' ? 0.55 : run.band === 'fair' ? 0.72 : 0.78
+    mesh.material.opacity = band === 'good' ? 0.55 : band === 'fair' ? 0.72 : 0.78
     mesh.material.depthWrite = false
     mesh.material.polygonOffset = true
     mesh.material.polygonOffsetFactor = -1
     mesh.material.polygonOffsetUnits = -1
     mesh.receiveShadow = false
     mesh.renderOrder = 2
-    mesh.userData.iriBand = run.band
+    mesh.userData.iriBand = band
     layer.add(mesh)
   })
   root.add(layer)
@@ -622,6 +650,9 @@ function makeMesh(geoData, color, extra = {}) {
   return mesh
 }
 
+const sharedTextures = new Set()
+const surfaceTexCache = {}
+
 function canvasTex(draw, size = 256, repeatX = 1, repeatY = 40) {
   const c = document.createElement('canvas')
   c.width = c.height = size
@@ -630,13 +661,15 @@ function canvasTex(draw, size = 256, repeatX = 1, repeatY = 40) {
   tex.wrapS = THREE.RepeatWrapping
   tex.wrapT = THREE.RepeatWrapping
   tex.repeat.set(repeatX, repeatY)
-  tex.anisotropy = 8
+  tex.anisotropy = 4
   tex.colorSpace = THREE.SRGBColorSpace
+  sharedTextures.add(tex)
   return tex
 }
 
 function asphaltMap() {
-  return canvasTex((ctx, s) => {
+  if (surfaceTexCache.asphalt) return surfaceTexCache.asphalt
+  surfaceTexCache.asphalt = canvasTex((ctx, s) => {
     ctx.fillStyle = '#26282c'
     ctx.fillRect(0, 0, s, s)
     for (let i = 0; i < 9000; i++) {
@@ -647,21 +680,26 @@ function asphaltMap() {
     ctx.fillStyle = 'rgba(70,72,76,0.08)'
     for (let y = 0; y < s; y += 18) ctx.fillRect(0, y, s, 1)
   }, 256, 2, 90)
+  return surfaceTexCache.asphalt
 }
 
 function grassMap() {
-  return canvasTex((ctx, s) => {
-    ctx.fillStyle = '#3d6a3a'
-    ctx.fillRect(0, 0, s, s)
-    for (let i = 0; i < 5000; i++) {
-      ctx.fillStyle = `rgba(${40 + Math.random() * 70},${90 + Math.random() * 80},${35 + Math.random() * 40},${0.25})`
-      ctx.fillRect(Math.random() * s, Math.random() * s, 1.5, 2 + Math.random() * 3)
-    }
-  }, 128, 4, 60)
+  if (!surfaceTexCache.grass) {
+    surfaceTexCache.grass = canvasTex((ctx, s) => {
+      ctx.fillStyle = '#3d6a3a'
+      ctx.fillRect(0, 0, s, s)
+      for (let i = 0; i < 5000; i++) {
+        ctx.fillStyle = `rgba(${40 + Math.random() * 70},${90 + Math.random() * 80},${35 + Math.random() * 40},${0.25})`
+        ctx.fillRect(Math.random() * s, Math.random() * s, 1.5, 2 + Math.random() * 3)
+      }
+    }, 128, 4, 60)
+  }
+  return surfaceTexCache.grass.clone()
 }
 
 function concreteMap() {
-  return canvasTex((ctx, s) => {
+  if (surfaceTexCache.concrete) return surfaceTexCache.concrete
+  surfaceTexCache.concrete = canvasTex((ctx, s) => {
     // Weathered grey base (one texture tile = one lane width across)
     ctx.fillStyle = '#b9b6ae'
     ctx.fillRect(0, 0, s, s)
@@ -720,6 +758,7 @@ function concreteMap() {
       ctx.stroke()
     }
   }, 256, 2, 40)
+  return surfaceTexCache.concrete
 }
 
 function addRibbon(root, points, left, right, y, color, extra = {}) {
@@ -729,10 +768,11 @@ function addRibbon(root, points, left, right, y, color, extra = {}) {
 }
 
 function addDashes(root, points, left, right, y, color) {
-  buildDashedRibbon(points, left, right, y, 4, 6).forEach((g) => {
-    const mesh = makeMesh(g, color, { roughness: 0.38, metalness: 0.06 })
-    if (mesh) root.add(mesh)
+  const mesh = makeMesh(mergeRibbonGeometries(buildDashedRibbon(points, left, right, y, 4, 6)), color, {
+    roughness: 0.38,
+    metalness: 0.06,
   })
+  if (mesh) root.add(mesh)
 }
 
 function addRealisticRoad(root, points) {
@@ -931,6 +971,11 @@ function recordFrame(medianPts, startKm, endKm, loc) {
 const LIGHT_SHOULDER_M =
   ROAD_SPEC.medianWidthM / 2 + ROAD_SPEC.laneWidthM * ROAD_SPEC.lanesIncreasing + 0.5
 
+/** Service-road inventory sits just beyond the service road's outer edge. */
+function sideOffsetM(p, mainM) {
+  return p?.road === 'service' ? SERVICE_ROAD_CENTRE_M + SERVICE_ROAD_WIDTH_M / 2 + 0.8 : mainM
+}
+
 /** Snap GPS to median, then offset by dir: Increasing = LHS, Decreasing = RHS, median = centreline. */
 function placeStreetLight(p, origin, medianPts) {
   const loc = lngLatToLocal(p.lng, p.lat, origin)
@@ -940,9 +985,10 @@ function placeStreetLight(p, origin, medianPts) {
     return { x: f.x, z: f.z, yaw: Math.atan2(f.nx, f.nz), doubleArm: true }
   }
   const sign = dirSideSign(p.dir)
+  const off = sideOffsetM(p, LIGHT_SHOULDER_M)
   return {
-    x: f.x + f.nx * LIGHT_SHOULDER_M * sign,
-    z: f.z + f.nz * LIGHT_SHOULDER_M * sign,
+    x: f.x + f.nx * off * sign,
+    z: f.z + f.nz * off * sign,
     yaw: Math.atan2(-f.nx * sign, -f.nz * sign),
     doubleArm: false,
   }
@@ -1418,9 +1464,10 @@ function placeOnCorridor(p, origin, medianPts, offsetM = LIGHT_SHOULDER_M + 0.4)
   if (d.startsWith('med')) return { x: f.x, z: f.z, yaw: Math.atan2(f.nx, f.nz) }
   if (d.startsWith('inc') || d.startsWith('dec')) {
     const sign = dirSideSign(p.dir)
+    const off = sideOffsetM(p, offsetM)
     return {
-      x: f.x + f.nx * offsetM * sign,
-      z: f.z + f.nz * offsetM * sign,
+      x: f.x + f.nx * off * sign,
+      z: f.z + f.nz * off * sign,
       yaw: Math.atan2(-f.nx * sign, -f.nz * sign),
     }
   }
@@ -1433,15 +1480,15 @@ function placeSignBoard(p, origin, medianPts, offsetM = LIGHT_SHOULDER_M + 0.4) 
   if (!medianPts?.length) return { x: loc.x, z: loc.z, yaw: 0 }
   const f = recordFrame(medianPts, p.start, p.end, loc)
   const d = String(p.dir || '').toLowerCase()
-  // Board +Z faces opposite of previous: flipped along corridor travel
-  const yawInc = Math.atan2(f.tx, f.tz)
-  const yawDec = Math.atan2(-f.tx, -f.tz)
+  const yawInc = Math.atan2(-f.tx, -f.tz)
+  const yawDec = Math.atan2(f.tx, f.tz)
   if (d.startsWith('med')) return { x: f.x, z: f.z, yaw: yawInc }
   if (d.startsWith('inc') || d.startsWith('dec')) {
     const sign = dirSideSign(p.dir)
+    const off = sideOffsetM(p, offsetM)
     return {
-      x: f.x + f.nx * offsetM * sign,
-      z: f.z + f.nz * offsetM * sign,
+      x: f.x + f.nx * off * sign,
+      z: f.z + f.nz * off * sign,
       yaw: d.startsWith('dec') ? yawDec : yawInc,
     }
   }
@@ -1553,8 +1600,660 @@ function addRoadFurniture(root, list, asset, origin, medianPts) {
     ])
     return list.length
   }
+  if (asset === 'Solar Blinker') {
+    const amber = new THREE.MeshStandardMaterial({ color: 0xffb300, emissive: 0xff8f00, emissiveIntensity: 1.2, roughness: 0.3 })
+    const panel = new THREE.MeshStandardMaterial({ color: 0x1a237e, roughness: 0.25, metalness: 0.5 })
+    addInstancedKit(root, placements, [
+      { geo: new THREE.CylinderGeometry(0.05, 0.06, 2.6, 8), mat: steel, oy: 1.3 },
+      { geo: new THREE.CylinderGeometry(0.16, 0.16, 0.12, 12), mat: amber, oy: 2.45, oz: 0.08, rx: Math.PI / 2 },
+      { geo: new THREE.BoxGeometry(0.45, 0.03, 0.35), mat: panel, oy: 2.75, rx: -0.4 },
+    ])
+    return list.length
+  }
+  if (asset === 'Pedestrian Guard Rail') {
+    addInstancedKit(root, placements, [
+      { geo: new THREE.BoxGeometry(6, 0.06, 0.06), mat: yellow, oy: 1.0 },
+      { geo: new THREE.BoxGeometry(6, 0.05, 0.05), mat: black, oy: 0.55 },
+      { geo: new THREE.BoxGeometry(0.06, 1.05, 0.06), mat: steel, ox: -2.9, oy: 0.52 },
+      { geo: new THREE.BoxGeometry(0.06, 1.05, 0.06), mat: steel, oy: 0.52 },
+      { geo: new THREE.BoxGeometry(0.06, 1.05, 0.06), mat: steel, ox: 2.9, oy: 0.52 },
+    ])
+    return list.length
+  }
   addInstancedKit(root, placements, [
     { geo: new THREE.CylinderGeometry(0.22, 0.28, 0.7, 10), mat: conc, oy: 0.35 },
+  ])
+  return list.length
+}
+
+const MEDIAN_TREES_PER_RECORD = 2
+const MEDIAN_TREE_VARIANTS = [11, 29, 47]
+const MEDIAN_CANOPY_W = 2.1
+const MEDIAN_CANOPY_H = 2.1
+const MEDIAN_CANOPY_BASE_Y = 0.85
+
+function seededRandom(seed) {
+  let s = seed >>> 0 || 1
+  return () => {
+    s = (s * 1664525 + 1013904223) >>> 0
+    return s / 4294967296
+  }
+}
+
+const medianCanopyCache = new Map()
+
+/**
+ * Transparent canopy-card texture for a young median tree: fine branches from
+ * the trunk top into leaf clumps, and an oval crown of small ovate leaves —
+ * dark inner shadow, mid greens, and pale sunlit leaves toward the upper side.
+ */
+function medianCanopyTexture(seed) {
+  const cached = medianCanopyCache.get(seed)
+  if (cached) return cached
+  const w = 512
+  const h = 616
+  const c = document.createElement('canvas')
+  c.width = w
+  c.height = h
+  const g = c.getContext('2d')
+  const rnd = seededRandom(seed)
+  const gauss = () => (rnd() + rnd() + rnd() - 1.5) / 1.5
+  const cx = w / 2
+  const cy = h * 0.46
+  const rx = w * 0.44
+  const ry = h * 0.43
+  const inCrown = (x, y) => ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1
+
+  const clumps = []
+  for (let i = 0; i < 14; i++) {
+    const a = rnd() * Math.PI * 2
+    const r = Math.sqrt(rnd()) * 0.72
+    clumps.push({ x: cx + Math.cos(a) * rx * r, y: cy + Math.sin(a) * ry * r, s: 46 + rnd() * 40 })
+  }
+
+  g.lineCap = 'round'
+  const trunkX = cx + (rnd() - 0.5) * 8
+  clumps.forEach((cl) => {
+    g.strokeStyle = rnd() > 0.5 ? '#6f5a55' : '#7d6862'
+    g.lineWidth = 2 + rnd() * 3
+    g.beginPath()
+    g.moveTo(trunkX, h)
+    g.quadraticCurveTo(trunkX + (cl.x - trunkX) * 0.25, cl.y + (h - cl.y) * 0.45, cl.x, cl.y)
+    g.stroke()
+  })
+
+  const leaf = (x, y, size, fill, edge) => {
+    g.save()
+    g.translate(x, y)
+    g.rotate(rnd() * Math.PI * 2)
+    g.beginPath()
+    g.ellipse(0, 0, size, size * 0.58, 0, 0, Math.PI * 2)
+    g.fillStyle = fill
+    g.fill()
+    if (edge) {
+      g.strokeStyle = edge
+      g.lineWidth = 1.1
+      g.stroke()
+    }
+    g.restore()
+  }
+
+  const scatter = (n, spread, pick) => {
+    for (let i = 0; i < n; i++) {
+      const cl = clumps[Math.floor(rnd() * clumps.length)]
+      const x = cl.x + gauss() * cl.s * spread
+      const y = cl.y + gauss() * cl.s * spread * 0.85
+      if (!inCrown(x, y)) continue
+      pick(x, y)
+    }
+  }
+
+  scatter(900, 0.9, (x, y) => {
+    const j = Math.round((rnd() - 0.5) * 16)
+    leaf(x, y, 6 + rnd() * 3, `rgb(${28 + j},${66 + j},${30 + j})`)
+  })
+  scatter(1000, 1.05, (x, y) => {
+    const j = Math.round((rnd() - 0.5) * 24)
+    leaf(x, y, 5.5 + rnd() * 3, `rgb(${58 + j},${112 + j},${44 + j})`, 'rgba(20,50,20,0.35)')
+  })
+  scatter(700, 1.15, (x, y) => {
+    const sun = Math.max(0, Math.min(1, 0.55 - (y - cy) / (ry * 2) - (x - cx) / (rx * 4)))
+    if (rnd() > 0.35 + sun * 0.6) return
+    const t = rnd()
+    const fill = t < 0.45 ? '#a9c97a' : t < 0.8 ? '#d3e3a8' : '#eef3d6'
+    leaf(x, y, 4.5 + rnd() * 2.5, fill, 'rgba(60,110,40,0.55)')
+  })
+
+  const tex = new THREE.CanvasTexture(c)
+  tex.colorSpace = THREE.SRGBColorSpace
+  tex.anisotropy = 4
+  tex.needsUpdate = true
+  sharedTextures.add(tex)
+  medianCanopyCache.set(seed, tex)
+  return tex
+}
+
+/**
+ * Young median trees: slim trunk on a square grass bed, with an oval leafy
+ * crown made of crossed alpha-tested canopy cards. Trees sit just off the
+ * centreline so they don't clash with median light poles.
+ */
+function addMedianPlants(root, list, origin, medianPts) {
+  if (!list?.length || !medianPts?.length) return 0
+  const dummy = new THREE.Object3D()
+  const local = new THREE.Object3D()
+  const composed = new THREE.Matrix4()
+  const tint = new THREE.Color()
+
+  const trees = []
+  list.forEach((p, ri) => {
+    const km = (Number(p.start) + Number(p.end ?? p.start)) / 2
+    if (!Number.isFinite(km)) return
+    const f = chainageFrame(medianPts, km)
+    const spanM = Math.max(6, (Math.abs(Number(p.end) - Number(p.start)) || 0.01) * 1000)
+    for (let k = 0; k < MEDIAN_TREES_PER_RECORD; k++) {
+      const seed = ri * MEDIAN_TREES_PER_RECORD + k
+      const along = ((k + 0.5) / MEDIAN_TREES_PER_RECORD - 0.5) * spanM + (hash01(seed, 21) - 0.5) * 0.6
+      const side = (k % 2 ? 1 : -1) * (0.35 + hash01(seed, 22) * 0.15)
+      trees.push({
+        seed,
+        x: f.x + f.tx * along + f.nx * side,
+        z: f.z + f.tz * along + f.nz * side,
+        yawBed: Math.atan2(f.tx, f.tz),
+        variant: Math.floor(hash01(seed, 26) * MEDIAN_TREE_VARIANTS.length),
+      })
+    }
+  })
+  if (!trees.length) return 0
+
+  const cardGeo = new THREE.PlaneGeometry(MEDIAN_CANOPY_W, MEDIAN_CANOPY_H)
+  cardGeo.translate(0, MEDIAN_CANOPY_BASE_Y + MEDIAN_CANOPY_H / 2, 0)
+  const trunkGeo = new THREE.CylinderGeometry(0.04, 0.065, MEDIAN_CANOPY_BASE_Y + 0.4, 7)
+  trunkGeo.translate(0, (MEDIAN_CANOPY_BASE_Y + 0.4) / 2, 0)
+  const trunkMat = new THREE.MeshStandardMaterial({ color: 0x7a6560, roughness: 0.9, metalness: 0 })
+  const bedGeo = new THREE.PlaneGeometry(1.7, 1.7)
+  bedGeo.rotateX(-Math.PI / 2)
+  bedGeo.translate(0, 0.035, 0)
+  const bedMat = new THREE.MeshStandardMaterial({ color: 0x78a85a, roughness: 0.95, metalness: 0 })
+  const pitGeo = new THREE.CircleGeometry(0.28, 14)
+  pitGeo.rotateX(-Math.PI / 2)
+  pitGeo.translate(0, 0.04, 0)
+  const pitMat = new THREE.MeshStandardMaterial({ color: 0xc9d3bf, roughness: 1, metalness: 0 })
+
+  const cardYaws = [0, Math.PI / 3, (2 * Math.PI) / 3]
+  const meshes = []
+
+  const placeTree = (b) => {
+    const s = 0.9 + hash01(b.seed, 23) * 0.2
+    dummy.position.set(b.x, 0, b.z)
+    dummy.rotation.set(0, hash01(b.seed, 24) * Math.PI * 2, 0)
+    dummy.scale.set(s, s * (0.94 + hash01(b.seed, 25) * 0.12), s)
+    dummy.updateMatrix()
+  }
+
+  MEDIAN_TREE_VARIANTS.forEach((texSeed, vi) => {
+    const group = trees.filter((b) => b.variant === vi)
+    if (!group.length) return
+    const mat = new THREE.MeshStandardMaterial({
+      map: medianCanopyTexture(texSeed),
+      alphaTest: 0.4,
+      side: THREE.DoubleSide,
+      roughness: 0.78,
+      metalness: 0,
+    })
+    const cards = cardYaws.map(() => new THREE.InstancedMesh(cardGeo, mat, group.length))
+    group.forEach((b, i) => {
+      placeTree(b)
+      cardYaws.forEach((yaw, ci) => {
+        local.position.set(0, 0, 0)
+        local.rotation.set(0, yaw + (hash01(b.seed, 40 + ci) - 0.5) * 0.2, 0)
+        local.scale.set(1, 1, 1)
+        local.updateMatrix()
+        composed.multiplyMatrices(dummy.matrix, local.matrix)
+        cards[ci].setMatrixAt(i, composed)
+        const v = 0.9 + hash01(b.seed, 60 + ci) * 0.12
+        cards[ci].setColorAt(i, tint.setRGB(v * 0.98, v, v * 0.94))
+      })
+    })
+    meshes.push(...cards)
+  })
+
+  const trunk = new THREE.InstancedMesh(trunkGeo, trunkMat, trees.length)
+  const bed = new THREE.InstancedMesh(bedGeo, bedMat, trees.length)
+  const pit = new THREE.InstancedMesh(pitGeo, pitMat, trees.length)
+  trees.forEach((b, i) => {
+    placeTree(b)
+    trunk.setMatrixAt(i, dummy.matrix)
+    pit.setMatrixAt(i, dummy.matrix)
+    dummy.rotation.set(0, b.yawBed, 0)
+    dummy.scale.set(1, 1, 1)
+    dummy.updateMatrix()
+    bed.setMatrixAt(i, dummy.matrix)
+  })
+  meshes.push(trunk, bed, pit)
+
+  meshes.forEach((mesh) => {
+    mesh.instanceMatrix.needsUpdate = true
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+    mesh.castShadow = false
+    mesh.receiveShadow = false
+    mesh.computeBoundingSphere()
+    root.add(mesh)
+  })
+  return list.length
+}
+
+const GANTRY_PANELS = 4
+
+/** Soft blurred word-shapes standing in for sign legends (no real destination text). */
+function drawBlurredLegend(g, x, y, maxW, lineH, rnd) {
+  const words = 1 + Math.floor(rnd() * 2)
+  let cx = x
+  g.save()
+  if ('filter' in g) g.filter = 'blur(9px)'
+  g.fillStyle = 'rgba(255,255,255,0.85)'
+  for (let i = 0; i < words && cx < x + maxW; i++) {
+    const ww = Math.min(x + maxW - cx, maxW * (0.38 + rnd() * 0.4))
+    g.beginPath()
+    g.roundRect(cx, y - lineH, ww, lineH, lineH * 0.3)
+    g.fill()
+    cx += ww + lineH * 0.5
+  }
+  g.restore()
+}
+
+function gantryBoardTexture(dir, km) {
+  const rnd = seededRandom(Math.round(km * 1000) + (dir === 'Decreasing' ? 7 : 3))
+  const w = 2048
+  const h = 400
+  const c = document.createElement('canvas')
+  c.width = w
+  c.height = h
+  const g = c.getContext('2d')
+  g.fillStyle = '#0a6b3d'
+  g.fillRect(0, 0, w, h)
+  g.strokeStyle = '#ffffff'
+  g.lineWidth = 10
+  g.strokeRect(14, 14, w - 28, h - 28)
+
+  const pw = (w - 28) / GANTRY_PANELS
+  for (let i = 0; i < GANTRY_PANELS; i++) {
+    const x0 = 14 + i * pw
+    if (i > 0) {
+      g.fillStyle = '#ffffff'
+      g.fillRect(x0 - 5, 14, 10, h - 28)
+    }
+    const pad = 34
+    drawBlurredLegend(g, x0 + pad, 165, pw - pad * 2 - 110, 86, rnd)
+
+    g.fillStyle = '#ffffff'
+    const ax = x0 + pw - pad - 34
+    g.beginPath()
+    g.moveTo(ax, 62)
+    g.lineTo(ax + 34, 108)
+    g.lineTo(ax + 12, 108)
+    g.lineTo(ax + 12, 168)
+    g.lineTo(ax - 12, 168)
+    g.lineTo(ax - 12, 108)
+    g.lineTo(ax - 34, 108)
+    g.closePath()
+    g.fill()
+
+    drawBlurredLegend(g, x0 + pad, 325, pw - pad * 2 - 140, 62, rnd)
+    g.save()
+    if ('filter' in g) g.filter = 'blur(8px)'
+    g.fillStyle = 'rgba(255,255,255,0.85)'
+    g.beginPath()
+    g.roundRect(x0 + pw - pad - 90, 325 - 62, 90, 62, 18)
+    g.fill()
+    g.restore()
+  }
+
+  const tex = new THREE.CanvasTexture(c)
+  tex.colorSpace = THREE.SRGBColorSpace
+  tex.anisotropy = 8
+  tex.needsUpdate = true
+  return tex
+}
+
+/** One gantry per carriageway cluster; median-side records are the gantry's inner post. */
+function gantryClusters(list) {
+  const sided = list
+    .filter((p) => /^(inc|dec)/i.test(String(p.dir || '')))
+    .sort((a, b) => a.start - b.start)
+  const out = []
+  sided.forEach((p) => {
+    const dir = String(p.dir).toLowerCase().startsWith('dec') ? 'Decreasing' : 'Increasing'
+    const near = out.find((o) => o.dir === dir && Math.abs(o.km - p.start) < 0.2)
+    if (!near) out.push({ dir, km: Number(p.start) })
+  })
+  list
+    .filter((p) => String(p.dir || '').toLowerCase().startsWith('med'))
+    .forEach((p) => {
+      if (!out.some((o) => Math.abs(o.km - p.start) < 0.2)) out.push({ dir: 'Increasing', km: Number(p.start) })
+    })
+  return out
+}
+
+/**
+ * Overhead gantry sign spanning one carriageway: two steel columns on
+ * pedestals, angled braces, twin cross-beams and a green 4-panel
+ * bilingual direction board facing oncoming traffic.
+ */
+function addGantrySigns(root, list, medianPts) {
+  if (!list?.length || !medianPts?.length) return 0
+  const steel = new THREE.MeshStandardMaterial({ color: 0x9aa3c2, metalness: 0.7, roughness: 0.3 })
+  const pedestal = new THREE.MeshStandardMaterial({ color: 0x4b5585, metalness: 0.5, roughness: 0.4 })
+  const footing = new THREE.MeshStandardMaterial({ color: 0xb9bec4, roughness: 0.9, metalness: 0 })
+  const back = new THREE.MeshStandardMaterial({ color: 0x8c949c, metalness: 0.55, roughness: 0.45 })
+
+  const innerM = ROAD_SPEC.medianWidthM / 2 - 0.7
+  const outerM = KERB_EDGE_M + 1.1
+  const span = outerM - innerM
+  const colH = 7.2
+  const boardW = span - 0.9
+  const boardH = 1.55
+  const boardY = 6.35
+  const beamYs = [5.85, 6.85]
+
+  const clusters = gantryClusters(list)
+  clusters.forEach(({ dir, km }) => {
+    const f = chainageFrame(medianPts, km)
+    const sideSign = dirSideSign(dir)
+    const travel = dir === 'Decreasing' ? -1 : 1
+    const mid = (innerM + outerM) / 2
+    const grp = new THREE.Group()
+    grp.position.set(f.x + f.nx * mid * sideSign, 0, f.z + f.nz * mid * sideSign)
+    grp.rotation.y = Math.atan2(-f.tx * travel, -f.tz * travel)
+
+    ;[-span / 2, span / 2].forEach((x, side) => {
+      const foot = new THREE.Mesh(new THREE.CylinderGeometry(0.62, 0.7, 0.25, 16), footing)
+      foot.position.set(x, 0.12, 0)
+      grp.add(foot)
+      const base = new THREE.Mesh(new THREE.CylinderGeometry(0.34, 0.4, 1.2, 16), pedestal)
+      base.position.set(x, 0.85, 0)
+      grp.add(base)
+      const collar = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.34, 0.35, 16), pedestal)
+      collar.position.set(x, 1.62, 0)
+      grp.add(collar)
+      const col = new THREE.Mesh(new THREE.CylinderGeometry(0.17, 0.19, colH - 1.6, 16), steel)
+      col.position.set(x, 1.6 + (colH - 1.6) / 2, 0)
+      grp.add(col)
+      const cap = new THREE.Mesh(new THREE.SphereGeometry(0.19, 12, 8, 0, Math.PI * 2, 0, Math.PI / 2), steel)
+      cap.position.set(x, colH, 0)
+      grp.add(cap)
+
+      const inward = side === 0 ? 1 : -1
+      const bx0 = x + inward * 0.12
+      const by0 = 4.6
+      const bx1 = x + inward * 1.35
+      const by1 = beamYs[0]
+      const len = Math.hypot(bx1 - bx0, by1 - by0)
+      const brace = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.075, len, 10), steel)
+      brace.position.set((bx0 + bx1) / 2, (by0 + by1) / 2, 0)
+      brace.rotation.z = -Math.atan2(bx1 - bx0, by1 - by0)
+      grp.add(brace)
+    })
+
+    beamYs.forEach((y) => {
+      const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, span, 12), steel)
+      beam.rotation.z = Math.PI / 2
+      beam.position.set(0, y, 0)
+      grp.add(beam)
+    })
+
+    const face = new THREE.MeshStandardMaterial({
+      map: gantryBoardTexture(dir, km),
+      roughness: 0.55,
+      metalness: 0.05,
+    })
+    const board = new THREE.Mesh(new THREE.BoxGeometry(boardW, boardH, 0.1), [back, back, back, back, face, back])
+    board.position.set(0, boardY, 0.28)
+    grp.add(board)
+
+    grp.traverse((o) => {
+      if (o.isMesh) {
+        o.castShadow = true
+        o.receiveShadow = true
+      }
+    })
+    root.add(grp)
+  })
+  return list.length
+}
+
+/** Arrow pointing up (rot = 0) or rotated, centred on (cx, cy), height ≈ 2 × s. */
+function drawSignArrow(g, cx, cy, s, rot = 0) {
+  g.save()
+  g.translate(cx, cy)
+  g.rotate(rot)
+  g.beginPath()
+  g.moveTo(0, -s)
+  g.lineTo(s * 0.72, -s * 0.28)
+  g.lineTo(s * 0.26, -s * 0.28)
+  g.lineTo(s * 0.26, s)
+  g.lineTo(-s * 0.26, s)
+  g.lineTo(-s * 0.26, -s * 0.28)
+  g.lineTo(-s * 0.72, -s * 0.28)
+  g.closePath()
+  g.fillStyle = '#ffffff'
+  g.fill()
+  g.restore()
+}
+
+function cantileverBoardTexture(seed) {
+  const rnd = seededRandom(seed)
+  const w = 1024
+  const h = 334
+  const c = document.createElement('canvas')
+  c.width = w
+  c.height = h
+  const g = c.getContext('2d')
+  g.fillStyle = '#0a6b3d'
+  g.fillRect(0, 0, w, h)
+  g.strokeStyle = '#ffffff'
+  g.lineWidth = 8
+  g.strokeRect(10, 10, w - 20, h - 20)
+  g.fillStyle = '#ffffff'
+  g.fillRect(w / 2 - 4, 40, 8, h - 80)
+
+  // Left panel: ↖ arrow then legend; right panel: legend then ↑ arrow
+  drawSignArrow(g, 80, h / 2, 60, -Math.PI / 4)
+  drawBlurredLegend(g, 160, 150, w / 2 - 200, 70, rnd)
+  drawBlurredLegend(g, 160, 272, w / 2 - 200, 62, rnd)
+  drawBlurredLegend(g, w / 2 + 40, 150, w / 2 - 200, 70, rnd)
+  drawBlurredLegend(g, w / 2 + 40, 272, w / 2 - 200, 62, rnd)
+  drawSignArrow(g, w - 80, h / 2, 64, 0)
+
+  const tex = new THREE.CanvasTexture(c)
+  tex.colorSpace = THREE.SRGBColorSpace
+  tex.anisotropy = 8
+  tex.needsUpdate = true
+  return tex
+}
+
+/**
+ * Roadside cantilever sign: single grey column on the outer shoulder that
+ * bends over into a horizontal arm carrying a green 2-panel direction board
+ * above the near lanes, facing oncoming traffic.
+ */
+function addCantileverSigns(root, list, medianPts) {
+  if (!list?.length || !medianPts?.length) return 0
+  const steel = new THREE.MeshStandardMaterial({ color: 0x8d9197, metalness: 0.65, roughness: 0.35 })
+  const footing = new THREE.MeshStandardMaterial({ color: 0xb9bec4, roughness: 0.9, metalness: 0 })
+  const back = new THREE.MeshStandardMaterial({ color: 0x8c949c, metalness: 0.55, roughness: 0.45 })
+
+  const poleM = KERB_EDGE_M + 1.1
+  const colH = 6.1
+  const bendR = 0.8
+  const armY = colH + bendR
+  const armLen = 5.2
+  const boardW = 4.6
+  const boardH = 1.5
+  const boardX0 = bendR + 0.15
+
+  const sites = []
+  ;[...list]
+    .filter((p) => /^(inc|dec)/i.test(String(p.dir || '')))
+    .sort((a, b) => a.start - b.start)
+    .forEach((p) => {
+      const dir = String(p.dir).toLowerCase().startsWith('dec') ? 'Decreasing' : 'Increasing'
+      if (!sites.some((s) => s.dir === dir && Math.abs(s.km - p.start) < 0.05)) {
+        sites.push({ dir, km: Number(p.start) })
+      }
+    })
+
+  // Board faces the same way as roadside signs; the road then lies toward local +X.
+  const ax = 1
+  const bend = new THREE.TubeGeometry(
+    new THREE.QuadraticBezierCurve3(
+      new THREE.Vector3(0, colH, 0),
+      new THREE.Vector3(0, armY, 0),
+      new THREE.Vector3(ax * bendR, armY, 0),
+    ),
+    16,
+    0.13,
+    12,
+    false,
+  )
+
+  sites.forEach(({ dir, km }, si) => {
+    const f = chainageFrame(medianPts, km)
+    const sideSign = dirSideSign(dir)
+    const travel = dir === 'Decreasing' ? -1 : 1
+    const grp = new THREE.Group()
+    grp.position.set(f.x + f.nx * poleM * sideSign, 0, f.z + f.nz * poleM * sideSign)
+    grp.rotation.y = Math.atan2(-f.tx * travel, -f.tz * travel)
+
+    const foot = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.56, 0.22, 16), footing)
+    foot.position.y = 0.11
+    grp.add(foot)
+    const plate = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.08, 0.55), steel)
+    plate.position.y = 0.26
+    grp.add(plate)
+    const col = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.15, colH - 0.3, 14), steel)
+    col.position.y = 0.3 + (colH - 0.3) / 2
+    grp.add(col)
+    grp.add(new THREE.Mesh(bend, steel))
+    const arm = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.13, armLen - bendR, 12), steel)
+    arm.rotation.z = Math.PI / 2
+    arm.position.set(ax * (bendR + (armLen - bendR) / 2), armY, -0.05)
+    grp.add(arm)
+    const endCap = new THREE.Mesh(new THREE.SphereGeometry(0.11, 10, 8), steel)
+    endCap.position.set(ax * armLen, armY, -0.05)
+    grp.add(endCap)
+
+    const face = new THREE.MeshStandardMaterial({
+      map: cantileverBoardTexture(Math.round(km * 1000) + si),
+      roughness: 0.55,
+      metalness: 0.05,
+    })
+    const board = new THREE.Mesh(new THREE.BoxGeometry(boardW, boardH, 0.08), [back, back, back, back, face, back])
+    board.position.set(ax * (boardX0 + boardW / 2), armY - 0.1, 0.16)
+    grp.add(board)
+
+    grp.traverse((o) => {
+      if (o.isMesh) {
+        o.castShadow = true
+        o.receiveShadow = true
+      }
+    })
+    root.add(grp)
+  })
+  return list.length
+}
+
+function octagonShape(r) {
+  const shape = new THREE.Shape()
+  for (let k = 0; k < 8; k++) {
+    const a = Math.PI / 8 + (k * Math.PI) / 4
+    if (k === 0) shape.moveTo(Math.cos(a) * r, Math.sin(a) * r)
+    else shape.lineTo(Math.cos(a) * r, Math.sin(a) * r)
+  }
+  shape.closePath()
+  return shape
+}
+
+/** Red octagon with white rim and a blurred legend (no readable text). */
+function mandatoryFaceTexture() {
+  const size = 256
+  const c = document.createElement('canvas')
+  c.width = size
+  c.height = size
+  const g = c.getContext('2d')
+  const oct = (R, fill) => {
+    g.beginPath()
+    for (let k = 0; k < 8; k++) {
+      const a = Math.PI / 8 + (k * Math.PI) / 4
+      const x = size / 2 + Math.cos(a) * R
+      const y = size / 2 - Math.sin(a) * R
+      if (k === 0) g.moveTo(x, y)
+      else g.lineTo(x, y)
+    }
+    g.closePath()
+    g.fillStyle = fill
+    g.fill()
+  }
+  oct(size / 2, '#ffffff')
+  oct(size / 2 - 14, '#d61f26')
+  g.save()
+  if ('filter' in g) g.filter = 'blur(7px)'
+  g.fillStyle = 'rgba(255,255,255,0.9)'
+  g.beginPath()
+  g.roundRect(size / 2 - 78, size / 2 - 26, 156, 52, 14)
+  g.fill()
+  g.restore()
+  const tex = new THREE.CanvasTexture(c)
+  tex.colorSpace = THREE.SRGBColorSpace
+  tex.anisotropy = 8
+  tex.needsUpdate = true
+  return tex
+}
+
+function stripedPostTexture() {
+  const c = document.createElement('canvas')
+  c.width = 16
+  c.height = 256
+  const g = c.getContext('2d')
+  const bands = 10
+  for (let i = 0; i < bands; i++) {
+    g.fillStyle = i % 2 ? '#f4f4f4' : '#141414'
+    g.fillRect(0, (i * c.height) / bands, c.width, c.height / bands)
+  }
+  const tex = new THREE.CanvasTexture(c)
+  tex.colorSpace = THREE.SRGBColorSpace
+  tex.needsUpdate = true
+  return tex
+}
+
+/** Mandatory sign: red octagon plate on a black-and-white striped post with a black base plate. */
+function addMandatorySigns(root, list, origin, medianPts) {
+  if (!list?.length) return 0
+  const r = 0.42
+  const depth = 0.02
+  const shape = octagonShape(r)
+
+  const faceGeo = new THREE.ShapeGeometry(shape)
+  const pos = faceGeo.attributes.position
+  const uv = faceGeo.attributes.uv
+  for (let i = 0; i < pos.count; i++) {
+    uv.setXY(i, pos.getX(i) / (2 * r) + 0.5, pos.getY(i) / (2 * r) + 0.5)
+  }
+  uv.needsUpdate = true
+  faceGeo.translate(0, 0, depth + 0.002)
+  const plateGeo = new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: false })
+
+  const postH = 2.3
+  const faceMat = new THREE.MeshStandardMaterial({ map: mandatoryFaceTexture(), roughness: 0.45, metalness: 0.05 })
+  const plateMat = new THREE.MeshStandardMaterial({ color: 0x9aa0a6, roughness: 0.5, metalness: 0.5 })
+  const postMat = new THREE.MeshStandardMaterial({ map: stripedPostTexture(), roughness: 0.55, metalness: 0.1 })
+  const baseMat = new THREE.MeshStandardMaterial({ color: 0x151515, roughness: 0.6, metalness: 0.2 })
+
+  addInstancedKit(root, list.map((p) => placeSignBoard(p, origin, medianPts)), [
+    { geo: new THREE.BoxGeometry(0.42, 0.05, 0.3), mat: baseMat, oy: 0.025 },
+    { geo: new THREE.CylinderGeometry(0.035, 0.035, postH, 12), mat: postMat, oy: postH / 2 + 0.05 },
+    { geo: plateGeo, mat: plateMat, oy: postH + 0.05, oz: 0.04 },
+    { geo: faceGeo, mat: faceMat, oy: postH + 0.05, oz: 0.04 },
   ])
   return list.length
 }
@@ -1584,6 +2283,21 @@ function addInventoryPoints(root, items, origin, medianPts) {
     }
     if (asset === 'Fuel Station') {
       n += addFuelStations(root, list, origin, medianPts)
+      return
+    }
+    if (asset === 'Median Plants') {
+      n += addMedianPlants(root, list, origin, medianPts)
+      return
+    }
+    if (asset === 'Sign Boards') {
+      const gantries = list.filter((p) => /gantry/i.test(p.sub || ''))
+      const cantilevers = list.filter((p) => /cantilever/i.test(p.sub || ''))
+      const mandatory = list.filter((p) => /mandatory/i.test(p.sub || ''))
+      const boards = list.filter((p) => !/gantry|cantilever|mandatory/i.test(p.sub || ''))
+      n += addGantrySigns(root, gantries, medianPts)
+      n += addCantileverSigns(root, cantilevers, medianPts)
+      n += addMandatorySigns(root, mandatory, origin, medianPts)
+      if (boards.length) n += addRoadFurniture(root, boards, asset, origin, medianPts)
       return
     }
     n += addRoadFurniture(root, list, asset, origin, medianPts)
@@ -1731,7 +2445,7 @@ function shoulderLineFromChainage(medianPts, startKm, endKm, dir, offsetM, gpsHi
 /** Service road: 7 m two-lane strip beyond a grass verge outside the main shoulder. */
 const SERVICE_ROAD_WIDTH_M = 7
 const SERVICE_ROAD_CENTRE_M = KERB_EDGE_M + 1.7 + 6.5 + SERVICE_ROAD_WIDTH_M / 2
-const SERVICE_SLIP_KM = 0.06
+const SERVICE_SLIP_KM = 0.08
 const SERVICE_SLIP_WIDTH_M = 5.5
 const SERVICE_SEGMENTS = serviceRoadData.segments || NONE
 
@@ -1755,44 +2469,94 @@ function offsetLineFromChainage(medianPts, startKm, endKm, sign, offA, offB) {
   return out
 }
 
+/**
+ * Surface between two lateral offsets that may vary along the run. Offsets are
+ * measured on the median normal (not the band's own bend), so tapering slip
+ * roads keep clean edges instead of flaring on the curve.
+ */
+function corridorBandGeometry(medianPts, d0, d1, sign, edgesAt, y) {
+  if (!(d1 > d0)) return null
+  const ds = []
+  for (let d = d0; d < d1; d += 1.5) ds.push(d)
+  ds.push(d1)
+  const n = ds.length
+  const positions = new Float32Array(n * 6)
+  const uvs = new Float32Array(n * 4)
+  ds.forEach((d, i) => {
+    const s = sampleAtDistance(medianPts, d)
+    const [a, b] = edgesAt(d)
+    positions.set([s.x + s.nx * a * sign, y, s.z + s.nz * a * sign, s.x + s.nx * b * sign, y, s.z + s.nz * b * sign], i * 6)
+    uvs.set([0, (d - d0) * 0.05, 1, (d - d0) * 0.05], i * 4)
+  })
+  const indices = new Uint32Array((n - 1) * 6)
+  for (let i = 0; i < n - 1; i++) {
+    const a = i * 2
+    indices.set([a, a + 2, a + 1, a + 1, a + 2, a + 3], i * 6)
+  }
+  return { positions, uvs, indices }
+}
+
 function addServiceRoads(root, segments, medianPts) {
   if (!segments?.length || !medianPts?.length) return 0
   const half = SERVICE_ROAD_WIDTH_M / 2
-  const slipHalf = SERVICE_SLIP_WIDTH_M / 2
-  const mainShoulderM = KERB_EDGE_M + 1.7
+  const serviceInner = SERVICE_ROAD_CENTRE_M - half
   const asphaltMat = { map: asphaltMap(), roughness: 0.96, metalness: 0.02 }
+  const markMat = { roughness: 0.42, metalness: 0.04 }
+  const { totalM } = polylineMetrics(medianPts)
+  const span = CHAINAGE_MAX_KM - CHAINAGE_MIN_KM || 1
+  const kmToD = (km) => Math.max(0, Math.min(totalM, ((km - CHAINAGE_MIN_KM) / span) * totalM))
+  const smooth = (u) => {
+    const t = Math.max(0, Math.min(1, u))
+    return t * t * (3 - 2 * t)
+  }
+  const band = (d0, d1, sign, edgesAt, y, color, extra) => {
+    const mesh = makeMesh(corridorBandGeometry(medianPts, d0, d1, sign, edgesAt, y), color, extra)
+    if (mesh) root.add(mesh)
+  }
+
   let n = 0
   segments.forEach((seg) => {
     const start = Number(seg.start)
     const end = Number(seg.end)
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return
     const sign = corridorSideSign(seg.dir, null, medianPts)
+    const dA = kmToD(start - SERVICE_SLIP_KM)
+    const dS = kmToD(start)
+    const dE = kmToD(end)
+    const dB = kmToD(end + SERVICE_SLIP_KM)
+    if (!(dB > dA)) return
+
+    // 0 at the main carriageway edge (slip mouth) → 1 on the service road proper
+    const blend = (d) => {
+      if (d < dS && dS > dA) return smooth((d - dA) / (dS - dA))
+      if (d > dE && dB > dE) return smooth((dB - d) / (dB - dE))
+      return 1
+    }
+    const edges = (d) => {
+      const e = blend(d)
+      const inner = KERB_EDGE_M + (serviceInner - KERB_EDGE_M) * e
+      const width = SERVICE_SLIP_WIDTH_M + (SERVICE_ROAD_WIDTH_M - SERVICE_SLIP_WIDTH_M) * e
+      return [inner, inner + width]
+    }
+    const offset = (dIn, dOut) => (d) => {
+      const [a, b] = edges(d)
+      return [a + dIn, b + dOut]
+    }
+
+    band(dA, dB, sign, offset(-1, 1), 0.025, SHOULDER, { roughness: 0.98, metalness: 0 })
+    band(dA, dB, sign, edges, 0.046, ASPHALT, asphaltMat)
+    band(dA, dB, sign, (d) => { const [a] = edges(d); return [a + 0.15, a + 0.3] }, 0.053, MARK_WHITE, markMat)
+    band(dA, dB, sign, (d) => { const [, b] = edges(d); return [b - 0.3, b - 0.15] }, 0.053, MARK_WHITE, markMat)
+
     const pts = offsetLineFromChainage(medianPts, start, end, sign, SERVICE_ROAD_CENTRE_M, SERVICE_ROAD_CENTRE_M)
-    if (pts.length < 2) return
-
-    addRibbon(root, pts, -(half + 1), half + 1, 0.025, SHOULDER, { roughness: 0.98, metalness: 0 })
-    addRibbon(root, pts, -half, half, 0.045, ASPHALT, asphaltMat)
-    addRibbon(root, pts, -half + 0.15, -half + 0.3, 0.052, MARK_WHITE, { roughness: 0.42, metalness: 0.04 })
-    addRibbon(root, pts, half - 0.3, half - 0.15, 0.052, MARK_WHITE, { roughness: 0.42, metalness: 0.04 })
-    addDashes(root, pts, -0.07, 0.07, 0.052, MARK_WHITE)
-
-    // Slip roads joining the main shoulder at both ends
-    const slips = [
-      offsetLineFromChainage(medianPts, start - SERVICE_SLIP_KM, start, sign, mainShoulderM + slipHalf, SERVICE_ROAD_CENTRE_M),
-      offsetLineFromChainage(medianPts, end, end + SERVICE_SLIP_KM, sign, SERVICE_ROAD_CENTRE_M, mainShoulderM + slipHalf),
-    ]
-    slips.forEach((slip) => {
-      if (slip.length < 2) return
-      addRibbon(root, slip, -(slipHalf + 0.6), slipHalf + 0.6, 0.024, SHOULDER, { roughness: 0.98, metalness: 0 })
-      addRibbon(root, slip, -slipHalf, slipHalf, 0.044, ASPHALT, asphaltMat)
-    })
+    if (pts.length >= 2) addDashes(root, pts, -0.07, 0.07, 0.053, MARK_WHITE)
     n += 1
   })
   return n
 }
 
 /** Merge barrier inventory segments on the same side when chainage gap is small. */
-function mergeBarrierRuns(lines) {
+function mergeBarrierRuns(lines, gapKm = 0.25) {
   const bySide = { Increasing: [], Decreasing: [], other: [] }
   lines.forEach((line) => {
     const d = String(line.dir || '')
@@ -1808,7 +2572,7 @@ function mergeBarrierRuns(lines) {
       const s = Number(line.start)
       const e = Number(line.end)
       if (!Number.isFinite(s) || !Number.isFinite(e) || e <= s) return
-      if (!cur || s - cur.end > 0.25) {
+      if (!cur || s - cur.end > gapKm) {
         cur = { dir: side, start: s, end: e }
         runs.push(cur)
       } else {
@@ -1820,14 +2584,14 @@ function mergeBarrierRuns(lines) {
   return runs
 }
 
-function barrierPathForRun(run, origin, medianPts) {
+function barrierPathForRun(run, origin, medianPts, edgeM = BARRIER_EDGE_M) {
   const start = Number(run.start)
   const end = Number(run.end)
   if (medianPts?.length && Number.isFinite(start) && Number.isFinite(end) && end > start) {
-    return shoulderLineFromChainage(medianPts, start, end, run.dir, BARRIER_EDGE_M, null)
+    return shoulderLineFromChainage(medianPts, start, end, run.dir, edgeM, null)
   }
   const raw = lineToLocalPoints(run, origin)
-  const snapped = snapLineToCorridorOffset(raw, medianPts, run.dir, BARRIER_EDGE_M)
+  const snapped = snapLineToCorridorOffset(raw, medianPts, run.dir, edgeM)
   return resamplePolyline(smoothPolyline2d(snapped, 3), 1.8)
 }
 
@@ -1863,12 +2627,41 @@ function addKerbs(root, lines, origin, medianPts) {
  * W-beam crash barrier on the shoulder only:
  * continuous ribbon rails (no lookAt zigzag) + posts every ~2.5 m.
  */
-function addCrashBarriers(root, lines, origin, medianPts) {
+/** Open the main-road barrier where a service-road slip meets the carriageway. */
+function cutRunsAtSlipMouths(runs) {
+  const mouthKm = SERVICE_SLIP_KM * 0.6
+  const gaps = SERVICE_SEGMENTS.flatMap((s) => {
+    const side = String(s.dir || '').slice(0, 3).toLowerCase()
+    const a = Number(s.start)
+    const b = Number(s.end)
+    return [
+      { side, from: a - SERVICE_SLIP_KM - 0.005, to: a - SERVICE_SLIP_KM + mouthKm },
+      { side, from: b + SERVICE_SLIP_KM - mouthKm, to: b + SERVICE_SLIP_KM + 0.005 },
+    ]
+  })
+  let out = runs
+  gaps.forEach((gap) => {
+    out = out.flatMap((run) => {
+      const side = String(run.dir || '').slice(0, 3).toLowerCase()
+      const s = Number(run.start)
+      const e = Number(run.end)
+      if (side !== gap.side || e <= gap.from || s >= gap.to) return [run]
+      const pieces = []
+      if (gap.from - s > 0.005) pieces.push({ ...run, start: s, end: gap.from })
+      if (e - gap.to > 0.005) pieces.push({ ...run, start: gap.to, end: e })
+      return pieces
+    })
+  })
+  return out
+}
+
+function addCrashBarriers(root, lines, origin, medianPts, edgeM = BARRIER_EDGE_M, gapKm = 0.25) {
   if (!lines?.length || !medianPts?.length) return 0
-  const runs = mergeBarrierRuns(lines)
+  const merged = mergeBarrierRuns(lines, gapKm)
+  const runs = edgeM === BARRIER_EDGE_M ? cutRunsAtSlipMouths(merged) : merged
   const samples = []
   runs.forEach((run) => {
-    const pts = barrierPathForRun(run, origin, medianPts)
+    const pts = barrierPathForRun(run, origin, medianPts, edgeM)
     if (pts.length >= 2) samples.push(pts)
   })
   if (!samples.length) return 0
@@ -1931,15 +2724,17 @@ function addCrashBarriers(root, lines, origin, medianPts) {
 function addInventoryLines(root, lines, origin, medianPts) {
   if (!lines?.length) return 0
   const barriers = []
+  const serviceBarriers = []
   const kerbs = []
   const other = []
   lines.forEach((line) => {
     const name = line.asset || line.name || ''
-    if (/barrier/i.test(name)) barriers.push(line)
+    if (/barrier/i.test(name)) (line.road === 'service' ? serviceBarriers : barriers).push(line)
     else if (/kerb/i.test(name)) kerbs.push(line)
     else other.push(line)
   })
   let n = addCrashBarriers(root, barriers, origin, medianPts)
+  n += addCrashBarriers(root, serviceBarriers, origin, medianPts, sideOffsetM({ road: 'service' }, 0) - 0.3, 0.02)
   n += addKerbs(root, kerbs, origin, medianPts)
   other.forEach((line) => {
     const points = lineToLocalPoints(line, origin)
@@ -1951,6 +2746,192 @@ function addInventoryLines(root, lines, origin, medianPts) {
     n += 1
   })
   return n
+}
+
+/** Lat/lng on the median centreline at a chainage (km). */
+function latLngAtKm(km) {
+  const coords = medianData.coordinates || []
+  if (coords.length < 2) return [22.65, 76.9]
+  if (!latLngAtKm.cum) {
+    const cum = [0]
+    for (let i = 1; i < coords.length; i++) {
+      const [lng0, lat0] = coords[i - 1]
+      const [lng1, lat1] = coords[i]
+      const dx = (lng1 - lng0) * Math.cos((((lat0 + lat1) / 2) * Math.PI) / 180) * 111320
+      const dy = (lat1 - lat0) * 110540
+      cum.push(cum[cum.length - 1] + Math.hypot(dx, dy))
+    }
+    latLngAtKm.cum = cum
+  }
+  const cum = latLngAtKm.cum
+  const total = cum[cum.length - 1] || 1
+  const span = CHAINAGE_MAX_KM - CHAINAGE_MIN_KM || 1
+  const d = Math.max(0, Math.min(((Number(km) - CHAINAGE_MIN_KM) / span) * total, total))
+  let lo = 1
+  let hi = cum.length - 1
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (cum[mid] < d) lo = mid + 1
+    else hi = mid
+  }
+  const i1 = Math.max(1, lo)
+  const i0 = i1 - 1
+  const t = (d - cum[i0]) / (cum[i1] - cum[i0] || 1)
+  const [lng0, lat0] = coords[i0]
+  const [lng1, lat1] = coords[i1]
+  return [lat0 + (lat1 - lat0) * t, lng0 + (lng1 - lng0) * t]
+}
+
+/** Small map of the corridor with a marker on the chainage the 3D view is showing. */
+function CorridorLocationMap({ km, winStart, winEnd }) {
+  const wrap = useRef(null)
+  const mapRef = useRef(null)
+  const markerRef = useRef(null)
+  const windowRef = useRef(null)
+
+  useEffect(() => {
+    const el = wrap.current
+    if (!el) return undefined
+    const line = (medianData.coordinates || []).map(([lng, lat]) => [lat, lng])
+    const m = L.map(el, { zoomControl: false, attributionControl: false, scrollWheelZoom: true })
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(m)
+    if (line.length > 1) {
+      L.polyline(line, { color: '#f59e0b', weight: 4, opacity: 0.9 }).addTo(m)
+    }
+    const here = latLngAtKm(km)
+    markerRef.current = L.circleMarker(here, {
+      radius: 8,
+      color: '#ffffff',
+      weight: 3,
+      fillColor: '#ef4444',
+      fillOpacity: 1,
+    }).addTo(m)
+    m.setView(here, 14)
+    mapRef.current = m
+    const ro = new ResizeObserver(() => m.invalidateSize())
+    ro.observe(el)
+    const t = setTimeout(() => m.invalidateSize(), 150)
+    return () => {
+      clearTimeout(t)
+      ro.disconnect()
+      m.remove()
+      mapRef.current = null
+      markerRef.current = null
+      windowRef.current = null
+    }
+    // Map is created once; chainage updates move the marker.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    const m = mapRef.current
+    const marker = markerRef.current
+    if (!m || !marker) return
+    const here = latLngAtKm(km)
+    marker.setLatLng(here)
+    if (windowRef.current) {
+      m.removeLayer(windowRef.current)
+      windowRef.current = null
+    }
+    if (Number.isFinite(winStart) && Number.isFinite(winEnd) && winEnd > winStart) {
+      windowRef.current = L.polyline([latLngAtKm(winStart), latLngAtKm(winEnd)], {
+        color: '#22d3ee',
+        weight: 7,
+        opacity: 0.95,
+      }).addTo(m)
+    }
+    m.panTo(here, { animate: true, duration: 0.35 })
+  }, [km, winStart, winEnd])
+
+  return (
+    <div className="relative h-full min-h-0 w-full overflow-hidden">
+      <div ref={wrap} className="absolute inset-0" />
+      <div className="pointer-events-none absolute bottom-2 left-2 z-[500] rounded-lg bg-black/75 px-2 py-1 text-[11px] font-semibold text-white shadow">
+        You are here · Ch {Number(km).toFixed(2)} km
+      </div>
+    </div>
+  )
+}
+
+function IriTrendChart({ points, activeDate }) {
+  if (!points?.length) return null
+  const lanes = ['L1', 'L2']
+  const colors = { L1: '#facc15', L2: '#38bdf8' }
+  const w = 360
+  const h = 92
+  const pad = { l: 34, r: 8, t: 16, b: 18 }
+  const maxY = Math.max(2800, ...points.flatMap((p) => lanes.map((lane) => (Number.isFinite(p[lane]) ? p[lane] * 1000 : 0))))
+  const innerW = w - pad.l - pad.r
+  const innerH = h - pad.t - pad.b
+  const xAt = (i) => pad.l + (points.length === 1 ? innerW / 2 : (i / (points.length - 1)) * innerW)
+  const yAt = (iri) => pad.t + (1 - (iri * 1000) / maxY) * innerH
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  const label = (d) => `${months[Number(String(d).slice(5, 7)) - 1] || ''} ${String(d).slice(2, 4)}`
+  const guide = (mm) => yAt(mm / 1000)
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="mt-1 block h-[92px] w-full" role="img" aria-label="IRI over survey dates">
+      {[1800, 2400].map((mm) => (
+        <g key={mm}>
+          <line x1={pad.l} x2={w - pad.r} y1={guide(mm)} y2={guide(mm)} stroke="#334155" strokeDasharray="3 3" />
+          <text x="2" y={guide(mm) + 3} fill="#64748b" fontSize="8">{mm}</text>
+        </g>
+      ))}
+      {lanes.map((lane) => {
+        const d = points
+          .map((p, i) => (Number.isFinite(p[lane]) ? `${xAt(i).toFixed(1)},${yAt(p[lane]).toFixed(1)}` : null))
+          .filter(Boolean)
+        if (d.length < 2) return null
+        return <path key={lane} d={`M${d.join('L')}`} fill="none" stroke={colors[lane]} strokeWidth="1.7" />
+      })}
+      {points.map((p, i) => lanes.map((lane) => (
+        Number.isFinite(p[lane]) ? (
+          <circle
+            key={`${lane}-${p.date}`}
+            cx={xAt(i)}
+            cy={yAt(p[lane])}
+            r={p.date === activeDate ? 3.4 : 2.1}
+            fill={colors[lane]}
+            stroke={p.date === activeDate ? '#ffffff' : 'none'}
+            strokeWidth="1.2"
+          />
+        ) : null
+      )))}
+      {points.map((p, i) => (
+        <text key={p.date} x={xAt(i)} y={h - 4} textAnchor="middle" fill={p.date === activeDate ? '#f8fafc' : '#94a3b8'} fontSize="8">
+          {label(p.date)}
+        </text>
+      ))}
+    </svg>
+  )
+}
+
+function CountTrendChart({ points, color = '#38bdf8' }) {
+  const rows = points || []
+  if (rows.length < 2 || rows.every((p) => !p.n)) return null
+  const w = 360
+  const h = 46
+  const pad = { l: 8, r: 8, t: 4, b: 14 }
+  const maxN = Math.max(...rows.map((p) => p.n), 1)
+  const innerW = w - pad.l - pad.r
+  const gap = 4
+  const barW = (innerW - gap * (rows.length - 1)) / rows.length
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  const label = (d) => `${months[Number(String(d).slice(5, 7)) - 1] || ''} ${String(d).slice(2, 4)}`
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="mt-1 block h-[46px] w-full" role="img" aria-label="Count over survey dates">
+      {rows.map((p, i) => {
+        const bh = Math.max(1, ((h - pad.t - pad.b) * p.n) / maxN)
+        const x = pad.l + i * (barW + gap)
+        const y = h - pad.b - bh
+        return (
+          <g key={p.date}>
+            <rect x={x} y={y} width={barW} height={bh} rx="2" fill={color} opacity={p.n ? 0.9 : 0.25} />
+            <text x={x + barW / 2} y={h - 3} textAnchor="middle" fill="#94a3b8" fontSize="8">{label(p.date)}</text>
+          </g>
+        )
+      })}
+    </svg>
+  )
 }
 
 export default function NanasaRoad3DModal({
@@ -1966,6 +2947,8 @@ export default function NanasaRoad3DModal({
 }) {
   const host = useRef(null)
   const runtime = useRef(null)
+  const reportedFilterRef = useRef('all')
+  const predictedFilterRef = useRef('off')
   const invPoints = useMemo(() => inventoryPoints || NONE, [inventoryPoints])
   const invLines = useMemo(() => inventoryLines || NONE, [inventoryLines])
 
@@ -2033,11 +3016,14 @@ export default function NanasaRoad3DModal({
   }, [])
 
   const [pathMode, setPathMode] = useState('lhs') // median | lhs | rhs
+  const [showGraphs, setShowGraphs] = useState(false)
   const [scrubT, setScrubT] = useState(0) // 0..1 along selected path
   const [followScrubber, setFollowScrubber] = useState(true)
   const [pavementFilter, setPavementFilter] = useState('all') // all | off | good | fair | poor
   const [reportedFilter, setReportedFilter] = useState('all') // all | off | low | medium | high
   const [predictedFilter, setPredictedFilter] = useState('off') // off by default — heavy layer
+  reportedFilterRef.current = reportedFilter
+  predictedFilterRef.current = predictedFilter
   const [openLayerMenu, setOpenLayerMenu] = useState(null) // pavementDate | pavement | reported | predicted | null
   const [selectedReported, setSelectedReported] = useState(null)
   const [focusedDistress, setFocusedDistress] = useState(null)
@@ -2239,12 +3225,17 @@ export default function NanasaRoad3DModal({
     const invLn = invLines.filter(
       (r) => overlapsKm(r.start, r.end ?? r.start, winStart, winEnd) && matchesPathDir(r.dir, pathMode),
     )
-    const lineNames = [...new Set(invLn.map((r) => r.asset || r.name || 'Line'))]
+    const invLabel = (r, fallback) =>
+      `${r.asset || r.name || fallback}${r.road === 'service' ? ' · Service Rd' : ''}`
+    const lineNames = [...new Set(invLn.map((r) => invLabel(r, 'Line')))]
     // 3D bridges barrier gaps (mergeBarrierRuns), so list barriers wherever a merged run is drawn
     const barrierLines = invLines.filter(
-      (r) => /barrier/i.test(r.asset || r.name || '') && matchesPathDir(r.dir, pathMode),
+      (r) =>
+        /barrier/i.test(r.asset || r.name || '') &&
+        r.road !== 'service' &&
+        matchesPathDir(r.dir, pathMode),
     )
-    if (barrierLines.length && !lineNames.some((n) => /barrier/i.test(n))) {
+    if (barrierLines.length && !lineNames.some((n) => /barrier/i.test(n) && !/service/i.test(n))) {
       const barrierName = barrierLines[0].asset || barrierLines[0].name || 'Crash Barrier'
       const drawn = mergeBarrierRuns(barrierLines).some((run) =>
         overlapsKm(run.start, run.end ?? run.start, winStart, winEnd),
@@ -2254,12 +3245,13 @@ export default function NanasaRoad3DModal({
     const onServiceRoad = SERVICE_SEGMENTS.some(
       (s) => matchesPathDir(s.dir, pathMode) && overlapsKm(s.start, s.end, winStart, winEnd),
     )
-    if (onServiceRoad && !lineNames.some((n) => /service/i.test(n))) lineNames.push('Service Road')
+    if (onServiceRoad && !lineNames.includes('Service Road')) lineNames.push('Service Road')
     const pointGroups = {}
     invPts.forEach((r) => {
-      const key = `${r.asset || r.name || 'Asset'}|${r.dir || ''}`
+      const label = invLabel(r, 'Asset')
+      const key = `${label}|${r.dir || ''}`
       if (!pointGroups[key]) {
-        pointGroups[key] = { asset: r.asset || r.name || 'Asset', dir: r.dir || '', count: 0 }
+        pointGroups[key] = { asset: label, dir: r.dir || '', count: 0 }
       }
       pointGroups[key].count += 1
     })
@@ -2286,6 +3278,56 @@ export default function NanasaRoad3DModal({
     invPoints,
     invLines,
   ])
+
+  const iriTrend = useMemo(() => {
+    const dates = [...(pmsData.dates || [])].sort()
+    const rows = (pmsData.records || []).filter((r) => {
+      if (r.project !== NANASA_PROJECT) return false
+      if (!overlapsKm(r.start, r.end, chainageSlice.winStart, chainageSlice.winEnd)) return false
+      return matchesPathDir(r.direction, pathMode)
+    })
+    return dates
+      .map((date) => {
+        const point = { date }
+        ;['L1', 'L2'].forEach((lane) => {
+          const hit = rows.filter((r) => r.date === date && r.lane === lane && Number.isFinite(Number(r.iri)))
+          point[lane] = hit.length ? hit.reduce((sum, r) => sum + Number(r.iri), 0) / hit.length : null
+        })
+        return point
+      })
+      .filter((p) => p.L1 != null || p.L2 != null)
+  }, [chainageSlice.winStart, chainageSlice.winEnd, pathMode])
+
+  const predictedIndex = useMemo(() => {
+    if (!showGraphs) return null
+    const index = new Map()
+    ;(predictedData.records || []).forEach((r) => {
+      if (r.project_name !== NANASA_PROJECT || !r.date) return
+      const bin = Math.floor(Number(r.chainage_start) * 10)
+      if (!Number.isFinite(bin)) return
+      const dir = String(r.direction || '').toLowerCase().startsWith('dec') ? 'd' : 'i'
+      const key = `${r.date}|${dir}|${bin}`
+      index.set(key, (index.get(key) || 0) + 1)
+    })
+    return index
+  }, [showGraphs])
+
+  const predictedTrend = useMemo(() => {
+    if (!predictedIndex) return []
+    const dates = [...(predictedData.projects_dates?.[NANASA_PROJECT] || [])].sort()
+    const startBin = Math.floor(chainageSlice.winStart * 10)
+    const endBin = Math.floor((chainageSlice.winEnd - 1e-6) * 10)
+    const dirs = pathMode === 'rhs' ? ['d'] : pathMode === 'lhs' ? ['i'] : ['i', 'd']
+    return dates.map((date) => {
+      let n = 0
+      for (let bin = startBin; bin <= endBin; bin += 1) {
+        dirs.forEach((dir) => {
+          n += predictedIndex.get(`${date}|${dir}|${bin}`) || 0
+        })
+      }
+      return { date, n }
+    })
+  }, [predictedIndex, chainageSlice.winStart, chainageSlice.winEnd, pathMode])
 
   const syncScrubTargets = useCallback((mode, t, follow) => {
     const rt = runtime.current
@@ -2417,17 +3459,12 @@ export default function NanasaRoad3DModal({
 
     const camera = new THREE.PerspectiveCamera(48, 1, 0.8, 120000)
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' })
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5))
-    renderer.shadowMap.enabled = true
-    renderer.shadowMap.type = THREE.BasicShadowMap
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1))
+    renderer.shadowMap.enabled = false
     renderer.toneMapping = THREE.ACESFilmicToneMapping
     renderer.toneMappingExposure = 1.12
     renderer.outputColorSpace = THREE.SRGBColorSpace
     el.appendChild(renderer.domElement)
-
-    const pmrem = new THREE.PMREMGenerator(renderer)
-    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.06).texture
-    pmrem.dispose()
 
     const controls = new OrbitControls(camera, renderer.domElement)
     controls.enableDamping = true
@@ -2437,15 +3474,7 @@ export default function NanasaRoad3DModal({
     const hemi = new THREE.HemisphereLight(0xeaf2ff, 0x4d5c42, 0.95)
     scene.add(hemi)
     const sun = new THREE.DirectionalLight(0xfff3dc, 1.35)
-    sun.castShadow = true
-    sun.shadow.mapSize.set(1024, 1024)
-    sun.shadow.camera.near = 8
-    sun.shadow.camera.far = 280
-    sun.shadow.camera.left = -60
-    sun.shadow.camera.right = 60
-    sun.shadow.camera.top = 60
-    sun.shadow.camera.bottom = -60
-    sun.shadow.bias = -0.0004
+    sun.castShadow = false
     scene.add(sun)
     scene.add(sun.target)
     scene.add(new THREE.AmbientLight(0x9eb0c2, 0.28))
@@ -2479,21 +3508,6 @@ export default function NanasaRoad3DModal({
     const concreteLayer = addConcretePavementSurfaces(root, points, origin, pmsRecords)
     const pavementLayer = addPavementIri(root, points, origin, pmsRecords)
     applyPavementFilter(pavementLayer, pavementFilter, concreteLayer)
-    const reportedLayer = addDistressLayer(root, reportedRecords, origin, points, 'reportedDistress', 1, true)
-    applyDistressFilter(reportedLayer, reportedFilter)
-    const predictedLayer = addDistressLayer(root, predictedRecords, origin, points, 'predictedDistress', 0.55, false)
-    applyDistressFilter(predictedLayer, predictedFilter)
-
-    const pointCount = addInventoryPoints(root, invPoints, origin, points)
-    const lineCount = addInventoryLines(root, invLines, origin, points)
-    addServiceRoads(root, SERVICE_SEGMENTS, points)
-    root.userData.invCounts = {
-      pointCount,
-      lineCount,
-      pavementCount: pavementLayer.children.length,
-      reportedCount: reportedRecords.length,
-      predictedCount: predictedRecords.length,
-    }
 
     const lhsMarker = makeScrubberMarker(0x22c55e, new THREE.MeshStandardMaterial({ color: 0x166534 }))
     const rhsMarker = makeScrubberMarker(0x3b82f6, new THREE.MeshStandardMaterial({ color: 0x1d4ed8 }))
@@ -2510,8 +3524,8 @@ export default function NanasaRoad3DModal({
       chainageHighlight,
       concreteLayer,
       pavementLayer,
-      reportedLayer,
-      predictedLayer,
+      reportedLayer: null,
+      predictedLayer: null,
       controls,
       camera,
       sun,
@@ -2600,7 +3614,39 @@ export default function NanasaRoad3DModal({
     renderer.domElement.addEventListener('pointerdown', onPointerDown)
     renderer.domElement.addEventListener('pointerup', onPointerUp)
 
+    const pending = []
+    let alive = true
+    const later = (fn) => {
+      const id = requestAnimationFrame(() => {
+        if (!alive || !runtime.current) return
+        fn()
+      })
+      pending.push(id)
+    }
+    later(() => {
+      const pmrem = new THREE.PMREMGenerator(renderer)
+      scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.06).texture
+      pmrem.dispose()
+      const reportedLayer = addDistressLayer(root, reportedRecords, origin, points, 'reportedDistress', 1, true)
+      applyDistressFilter(reportedLayer, reportedFilterRef.current)
+      if (runtime.current) runtime.current.reportedLayer = reportedLayer
+      later(() => {
+        const predictedLayer = addDistressLayer(root, predictedRecords, origin, points, 'predictedDistress', 0.55, false)
+        applyDistressFilter(predictedLayer, predictedFilterRef.current)
+        if (runtime.current) runtime.current.predictedLayer = predictedLayer
+        later(() => {
+          addInventoryLines(root, invLines, origin, points)
+          addServiceRoads(root, SERVICE_SEGMENTS, points)
+          later(() => {
+            addInventoryPoints(root, invPoints, origin, points)
+          })
+        })
+      })
+    })
+
     return () => {
+      alive = false
+      pending.forEach((id) => cancelAnimationFrame(id))
       runtime.current = null
       scrubRef.current.ready = false
       cancelAnimationFrame(raf)
@@ -2609,12 +3655,13 @@ export default function NanasaRoad3DModal({
       renderer.domElement.removeEventListener('pointerup', onPointerUp)
       controls.dispose()
       renderer.dispose()
+      if (scene.environment) scene.environment.dispose()
       scene.traverse((obj) => {
         if (obj.geometry) obj.geometry.dispose()
         if (obj.material) {
           const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
           mats.forEach((m) => {
-            if (m.map) m.map.dispose()
+            if (m.map && !sharedTextures.has(m.map)) m.map.dispose()
             m.dispose()
           })
         }
@@ -2759,7 +3806,8 @@ export default function NanasaRoad3DModal({
 
   return (
     <div ref={shellRef} className={shellClass}>
-      <div className="relative min-h-0 flex-1">
+      <div className="flex min-h-0 flex-1">
+        <div className={`relative min-h-0 ${isMinimized ? 'w-full' : 'w-1/2'}`}>
         <div ref={host} className="absolute inset-0" />
         <div
           className={`pointer-events-none absolute inset-0 z-40 flex flex-col items-center justify-center gap-4 bg-gradient-to-b from-[#a8c6de] via-[#8fb3cf] to-[#4d7a4a] transition-opacity duration-500 ${sceneLoading ? 'opacity-100' : 'opacity-0'}`}
@@ -2895,290 +3943,6 @@ export default function NanasaRoad3DModal({
               <span aria-hidden className="text-[22px] leading-none">▶</span>
             </button>
           </div>
-        </div>
-        <div className="pointer-events-none absolute left-3 top-3 z-20 flex max-h-[calc(100%-8rem)] w-[min(280px,calc(100%-5.5rem))] flex-col gap-2 overflow-hidden">
-          <div className="pointer-events-auto flex min-h-0 flex-col gap-2 overflow-hidden">
-            {/* Vertical cards */}
-            <div className="flex min-h-0 flex-col gap-2 overflow-y-auto overflow-x-hidden pl-1 [direction:rtl] [&>*]:[direction:ltr] [scrollbar-width:thin] [scrollbar-color:rgba(255,255,255,0.45)_transparent] [text-shadow:0_1px_2px_rgba(0,0,0,0.95),0_0_6px_rgba(0,0,0,0.75)]">
-              {/* Pavement */}
-              <div className="shrink-0 rounded-2xl border border-slate-700/45 bg-transparent p-2.5">
-                <div className="mb-1.5 flex items-center gap-1.5">
-                  <span className="text-emerald-300 drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)]" aria-hidden>
-                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M4 19V9 M10 19V5 M16 19v-7 M22 19V7" />
-                    </svg>
-                  </span>
-                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-emerald-300">
-                    Pavement score
-                  </p>
-                  {chainageSlice.pavement.length > 0 && (
-                    <span className="shrink-0 rounded-full bg-black/40 px-1.5 text-[10px] font-bold text-white [text-shadow:none]">
-                      {chainageSlice.pavement.length}
-                    </span>
-                  )}
-                </div>
-                {chainageSlice.pavement.length === 0 ? (
-                  <div className="flex min-h-[72px] flex-col items-center justify-center rounded-xl border border-dashed border-slate-700/45 px-2 text-center">
-                    <p className="m-0 text-[14px] font-semibold text-white">No PMS data</p>
-                    <p className="mb-0 mt-0.5 text-[12px] text-slate-100">For this bin</p>
-                  </div>
-                ) : (
-                  <div className="flex max-h-40 flex-col gap-1 overflow-y-auto pl-1 [direction:rtl] [&>*]:[direction:ltr] [scrollbar-width:thin]">
-                    {chainageSlice.pavement.map((r, i) => {
-                      const band = iriBand(r)
-                      return (
-                        <div key={`pms-${r.i ?? i}`} className="shrink-0 rounded-xl bg-transparent px-2 py-1">
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="truncate text-[15px] font-semibold capitalize text-white">{r.pavement || '—'}</span>
-                            <span
-                              className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold [text-shadow:none]"
-                              style={{
-                                background:
-                                  band === 'good' ? '#111111' : band === 'fair' ? '#eab308' : band === 'poor' ? '#e2e8f0' : '#64748b',
-                                color: band === 'poor' || band === 'fair' ? '#0f172a' : '#f8fafc',
-                              }}
-                            >
-                              {iriBandLabel(band)}
-                            </span>
-                          </div>
-                          <p className="mb-0 mt-0.5 truncate text-[12px] font-medium text-slate-100">
-                            IRI {Number.isFinite(Number(r.iri)) ? Number(r.iri).toFixed(3) : '—'}
-                            {r.pcs ? ` • PCS ${r.pcs}` : ''}
-                          </p>
-                          {r.iriStatus ? (
-                            <p className="mb-0 mt-0.5 line-clamp-1 text-[11px] leading-snug text-slate-200">{r.iriStatus}</p>
-                          ) : null}
-                        </div>
-                      )
-                    })}
-                  </div>
-                )}
-              </div>
-
-              {/* Reported */}
-              <div className="shrink-0 rounded-2xl border border-slate-700/45 bg-transparent p-2.5">
-                <div className="mb-1.5 flex items-center gap-1.5">
-                  <span className="text-amber-300 drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)]" aria-hidden>
-                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M12 3 L22 20 H2 Z" />
-                      <path d="M12 9 v5 M12 17 h.01" />
-                    </svg>
-                  </span>
-                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-amber-300">
-                    Reported distress
-                  </p>
-                  {chainageSlice.reported.length > 0 && (
-                    <span className="shrink-0 rounded-full bg-black/40 px-1.5 text-[10px] font-bold text-white [text-shadow:none]">
-                      {chainageSlice.reported.length}
-                    </span>
-                  )}
-                </div>
-                {chainageSlice.reported.length === 0 ? (
-                  <div className="flex min-h-[72px] flex-col items-center justify-center gap-1 rounded-xl border border-dashed border-slate-700/45 px-2 text-center">
-                    <p className="m-0 text-[14px] font-semibold text-white">No distress reported</p>
-                    <p className="mb-0 text-[12px] text-slate-100">Looks good!</p>
-                  </div>
-                ) : (
-                  <div className="flex max-h-40 flex-col gap-1 overflow-y-auto pl-1 [direction:rtl] [&>*]:[direction:ltr] [scrollbar-width:thin]">
-                    {chainageSlice.reported.map((r, i) => (
-                      <button
-                        type="button"
-                        key={`rep-${i}`}
-                        onClick={() => locateDistress(r, 'reported')}
-                        title="Locate in 3D"
-                        className={`block w-full shrink-0 cursor-pointer rounded-xl px-2 py-1 text-left transition hover:bg-white/15 ${focusedDistress === r ? 'bg-white/20 ring-1 ring-amber-300/80' : 'bg-transparent'}`}
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="min-w-0 truncate text-[15px] font-semibold text-white">
-                            {r.distress_type || 'Distress'}
-                          </span>
-                          <span
-                            className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold text-slate-900 [text-shadow:none]"
-                            style={{
-                              background:
-                                r.severity === 'High' ? '#ef4444' : r.severity === 'Medium' ? '#eab308' : '#16a34a',
-                              color: r.severity === 'Medium' ? '#0f172a' : '#fff',
-                            }}
-                          >
-                            {r.severity || 'Low'}
-                          </span>
-                        </div>
-                        <p className="mb-0 mt-0.5 truncate text-[12px] font-medium text-amber-200">
-                          {String(r.direction || '').toLowerCase().startsWith('dec') ? '↘' : '↗'}{' '}
-                          {r.direction || '—'}
-                          {r.area != null ? ` • ${Number(r.area).toFixed(2)} m²` : ''}
-                          {Number.isFinite(Number(r.chainage_start)) ? ` • Ch ${Number(r.chainage_start).toFixed(3)}` : ''}
-                        </p>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {/* Predicted */}
-              <div className="shrink-0 rounded-2xl border border-slate-700/45 bg-transparent p-2.5">
-                <div className="mb-1.5 flex items-center gap-1.5">
-                  <span className="text-cyan-300 drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)]" aria-hidden>
-                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M3 17 L9 11 L13 15 L21 6" />
-                      <path d="M16 6 h5 v5" />
-                    </svg>
-                  </span>
-                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-cyan-300">
-                    Predicted distress
-                  </p>
-                  {chainageSlice.predicted.length > 0 && (
-                    <span className="shrink-0 rounded-full bg-black/40 px-1.5 text-[10px] font-bold text-white [text-shadow:none]">
-                      {chainageSlice.predicted.length}
-                    </span>
-                  )}
-                </div>
-                {chainageSlice.predicted.length === 0 ? (
-                  <div className="flex min-h-[72px] flex-col items-center justify-center rounded-xl border border-dashed border-slate-700/45 px-2 text-center">
-                    <p className="m-0 text-[14px] font-semibold text-white">No prediction</p>
-                    <p className="mb-0 mt-0.5 text-[12px] text-slate-100">For this bin</p>
-                  </div>
-                ) : (
-                  <div className="flex max-h-40 flex-col gap-1 overflow-y-auto pl-1 [direction:rtl] [&>*]:[direction:ltr] [scrollbar-width:thin]">
-                    {chainageSlice.predicted.map((r, i) => (
-                      <button
-                        type="button"
-                        key={`pred-${i}`}
-                        onClick={() => locateDistress(r, 'predicted')}
-                        title="Locate in 3D"
-                        className={`block w-full shrink-0 cursor-pointer rounded-xl px-2 py-1 text-left transition hover:bg-white/15 ${focusedDistress === r ? 'bg-white/20 ring-1 ring-cyan-300/80' : 'bg-transparent'}`}
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="min-w-0 truncate text-[15px] font-semibold text-white">
-                            {r.distress_type || 'Distress'}
-                          </span>
-                          <span
-                            className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold text-slate-900 [text-shadow:none]"
-                            style={{
-                              background:
-                                r.severity === 'High' ? '#f472b6' : r.severity === 'Medium' ? '#a78bfa' : '#38bdf8',
-                            }}
-                          >
-                            {r.severity || 'Low'}
-                          </span>
-                        </div>
-                        <p className="mb-0 mt-0.5 truncate text-[12px] font-medium text-cyan-200">
-                          {String(r.direction || '').toLowerCase().startsWith('dec') ? '↘' : '↗'}{' '}
-                          {r.direction || '—'}
-                          {Number.isFinite(Number(r.chainage_start)) ? ` • Ch ${Number(r.chainage_start).toFixed(3)}` : ''}
-                        </p>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {/* Inventory */}
-              <div className="shrink-0 rounded-2xl border border-slate-700/45 bg-transparent p-2.5">
-                <div className="mb-1.5 flex items-center gap-1.5">
-                  <span className="text-fuchsia-300 drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)]" aria-hidden>
-                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M12 3 L21 8 L12 13 L3 8 Z" />
-                      <path d="M3 8 v8 l9 5 M21 8 v8 l-9 5 M12 13 v8" />
-                    </svg>
-                  </span>
-                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-fuchsia-300">
-                    Inventory
-                  </p>
-                  {chainageSlice.inventoryPoints.length + chainageSlice.inventoryLines.length > 0 && (
-                    <span className="shrink-0 rounded-full bg-black/40 px-1.5 text-[10px] font-bold text-white [text-shadow:none]">
-                      {chainageSlice.inventoryPoints.length + chainageSlice.inventoryLines.length}
-                    </span>
-                  )}
-                </div>
-                {chainageSlice.inventoryPoints.length === 0 && chainageSlice.inventoryLines.length === 0 ? (
-                  <div className="flex min-h-[72px] flex-col items-center justify-center rounded-xl border border-dashed border-slate-700/45 px-2 text-center">
-                    <p className="m-0 text-[14px] font-semibold text-white">No inventory</p>
-                    <p className="mb-0 mt-0.5 text-[12px] text-slate-100">In this bin</p>
-                  </div>
-                ) : (
-                  <div className="flex max-h-52 flex-col gap-1 overflow-y-auto pl-1 [direction:rtl] [&>*]:[direction:ltr] [scrollbar-width:thin]">
-                    {[
-                      ...chainageSlice.inventoryLines.map((name) => ({
-                        key: `line-${name}`,
-                        title: name,
-                        badge: 'Linear',
-                        sub: 'Covers this chainage',
-                      })),
-                      ...chainageSlice.inventoryPoints.map((g) => ({
-                        key: `pt-${g.asset}-${g.dir}`,
-                        title: g.asset,
-                        badge: `×${g.count}`,
-                        sub: g.dir || 'Point asset',
-                      })),
-                    ]
-                      .map((item) => (
-                        <div key={item.key} className="shrink-0 rounded-xl bg-transparent px-2 py-1">
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="min-w-0 truncate text-[15px] font-semibold text-white">{item.title}</span>
-                            <span className="shrink-0 rounded-full bg-black/55 px-2 py-0.5 text-[11px] font-bold text-white [text-shadow:none]">
-                              {item.badge}
-                            </span>
-                          </div>
-                          <p className="mb-0 mt-0.5 truncate text-[12px] font-medium text-slate-100">{item.sub}</p>
-                        </div>
-                      ))}
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
-          {selectedReported && (
-            <div className="pointer-events-auto rounded-xl border border-white/15 bg-black/75 p-3 shadow-xl backdrop-blur">
-              <div className="mb-2 flex items-start justify-between gap-2">
-                <div>
-                  <p className="m-0 text-[10px] font-semibold uppercase tracking-wide text-slate-400">Reported distress</p>
-                  <h3 className="m-0 text-[15px] font-semibold text-white">{selectedReported.distress_type || 'Distress'}</h3>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setSelectedReported(null)}
-                  className="rounded-md px-1.5 py-0.5 text-[12px] text-slate-300 hover:bg-white/10 hover:text-white"
-                  title="Close"
-                >
-                  ✕
-                </button>
-              </div>
-              <div className="mb-2">
-                <span
-                  className="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-semibold text-white"
-                  style={{
-                    background:
-                      selectedReported.severity === 'High'
-                        ? '#ef4444'
-                        : selectedReported.severity === 'Medium'
-                          ? '#ca8a04'
-                          : '#16a34a',
-                  }}
-                >
-                  {selectedReported.severity || 'Low'}
-                </span>
-              </div>
-              <dl className="m-0 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12px]">
-                {[
-                  ['Chainage', `${selectedReported.chainage_start ?? '—'} – ${selectedReported.chainage_end ?? '—'} km`],
-                  ['Direction', selectedReported.direction || '—'],
-                  ['Pavement', selectedReported.pavement_type || '—'],
-                  ['Lane', selectedReported.lane || '—'],
-                  ['Area', selectedReported.area != null ? `${Number(selectedReported.area).toFixed(2)} m²` : '—'],
-                  ['Length', selectedReported.length != null ? `${Number(selectedReported.length).toFixed(2)} m` : '—'],
-                  ['Width', selectedReported.width != null ? `${Number(selectedReported.width).toFixed(2)} m` : '—'],
-                  ['Depth', selectedReported.depth != null ? `${Number(selectedReported.depth)}` : '—'],
-                  ['Date', selectedReported.date || '—'],
-                ].map(([k, v]) => (
-                  <div key={k} className="contents">
-                    <dt className="text-slate-400">{k}</dt>
-                    <dd className="m-0 font-medium text-slate-100">{v}</dd>
-                  </div>
-                ))}
-              </dl>
-            </div>
-          )}
         </div>
         {layerMenus.length > 0 && (
           <div className="pointer-events-auto absolute right-3 top-12 z-20 flex w-[min(210px,calc(100%-1.5rem))] flex-col gap-1.5">
@@ -3331,6 +4095,292 @@ export default function NanasaRoad3DModal({
           </div>
         </div>
         </>
+        )}
+        </div>
+        {!isMinimized && (
+          <div className="flex min-h-0 w-1/2 min-w-0 flex-col border-l border-white/10 bg-[#0b1220]">
+            <div className="relative z-0 h-[42%] shrink-0 overflow-hidden">
+              <CorridorLocationMap km={currentKm} winStart={chainageSlice.winStart} winEnd={chainageSlice.winEnd} />
+            </div>
+            <div className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-hidden border-t border-white/10 p-2">
+              <button
+                type="button"
+                onClick={() => setShowGraphs((on) => !on)}
+                className="shrink-0 self-start rounded-full border border-white/20 bg-white/10 px-3 py-1 text-[12px] font-semibold text-white hover:bg-white/20"
+              >
+                {showGraphs ? 'Hide graphs' : 'View graphs'}
+              </button>
+              {/* Pavement */}
+              <div className="shrink-0 overflow-hidden rounded-2xl border border-white/10 bg-white/[0.04] p-2">
+                <div className="mb-1.5 flex shrink-0 items-center gap-1.5">
+                  <span className="text-emerald-300" aria-hidden>
+                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M4 19V9 M10 19V5 M16 19v-7 M22 19V7" />
+                    </svg>
+                  </span>
+                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-emerald-300">
+                    Pavement score
+                  </p>
+                  {chainageSlice.pavement.length > 0 && (
+                    <span className="shrink-0 rounded-full bg-black/40 px-1.5 text-[10px] font-bold text-white [text-shadow:none]">
+                      {chainageSlice.pavement.length}
+                    </span>
+                  )}
+                </div>
+                {chainageSlice.pavement.length === 0 ? (
+                  <p className="m-0 truncate px-1 text-[12px] text-slate-300">No PMS data for this bin</p>
+                ) : (
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-1 overflow-hidden">
+                    {chainageSlice.pavement.map((r, i) => {
+                      const band = iriBand(r)
+                      return (
+                        <div key={`pms-${r.i ?? i}`} className="shrink-0 rounded-xl bg-transparent px-2 py-1">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="truncate text-[15px] font-semibold capitalize text-white">
+                              {r.pavement || '—'}
+                              {r.lane ? <span className="ml-1.5 text-[12px] font-medium normal-case text-slate-200">{r.direction ? `${r.direction.slice(0, 3)} · ` : ''}{r.lane}</span> : null}
+                            </span>
+                            <span
+                              className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold [text-shadow:none]"
+                              style={{
+                                background:
+                                  band === 'good' ? '#111111' : band === 'fair' ? '#eab308' : band === 'poor' ? '#e2e8f0' : '#64748b',
+                                color: band === 'poor' || band === 'fair' ? '#0f172a' : '#f8fafc',
+                              }}
+                            >
+                              {iriBandLabel(band)}
+                            </span>
+                          </div>
+                          <p className="mb-0 mt-0.5 truncate text-[12px] font-medium text-slate-100">
+                            IRI {Number.isFinite(Number(r.iri)) ? Math.round(Number(r.iri) * 1000) : '—'} mm/km
+                            {r.pcs ? ` • PCS ${r.pcs}` : ''}
+                          </p>
+                          {r.iriStatus ? (
+                            <p className="mb-0 mt-0.5 line-clamp-1 text-[11px] leading-snug text-slate-200">{r.iriStatus}</p>
+                          ) : null}
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+                {showGraphs && iriTrend.length > 1 && (
+                  <div className="mt-1 border-t border-white/10 pt-1">
+                    <div className="flex items-center gap-3 px-1 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                      <span>IRI over surveys</span>
+                      <span className="inline-flex items-center gap-1 normal-case tracking-normal text-slate-300"><i className="inline-block h-1.5 w-3 rounded-sm bg-[#facc15]" />L1</span>
+                      <span className="inline-flex items-center gap-1 normal-case tracking-normal text-slate-300"><i className="inline-block h-1.5 w-3 rounded-sm bg-[#38bdf8]" />L2</span>
+                    </div>
+                    <IriTrendChart points={iriTrend} activeDate={pavementDate} />
+                  </div>
+                )}
+              </div>
+
+              {/* Reported */}
+              <div className="shrink-0 overflow-hidden rounded-2xl border border-white/10 bg-white/[0.04] p-2">
+                <div className="mb-1.5 flex shrink-0 items-center gap-1.5">
+                  <span className="text-amber-300" aria-hidden>
+                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M12 3 L22 20 H2 Z" />
+                      <path d="M12 9 v5 M12 17 h.01" />
+                    </svg>
+                  </span>
+                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-amber-300">
+                    Reported distress
+                  </p>
+                  {chainageSlice.reported.length > 0 && (
+                    <span className="shrink-0 rounded-full bg-black/40 px-1.5 text-[10px] font-bold text-white [text-shadow:none]">
+                      {chainageSlice.reported.length}
+                    </span>
+                  )}
+                </div>
+                {chainageSlice.reported.length === 0 ? (
+                  <p className="m-0 truncate px-1 text-[12px] text-slate-300">No distress reported · Looks good!</p>
+                ) : (
+                  <div className="grid grid-cols-3 gap-x-2 gap-y-0.5 overflow-hidden">
+                    {chainageSlice.reported.map((r, i) => (
+                      <button
+                        type="button"
+                        key={`rep-${i}`}
+                        onClick={() => locateDistress(r, 'reported')}
+                        title="Locate in 3D"
+                        className={`flex w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-lg px-1.5 py-0.5 text-left transition hover:bg-white/15 ${focusedDistress === r ? 'bg-white/20 ring-1 ring-amber-300/80' : 'bg-transparent'}`}
+                      >
+                        <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-white">
+                          {r.distress_type || 'Distress'}
+                          <span className="ml-1.5 text-[11px] font-medium text-amber-200">
+                            {String(r.direction || '').toLowerCase().startsWith('dec') ? '↘' : '↗'} {r.direction || '—'}
+                            {r.area != null ? ` · ${Number(r.area).toFixed(1)} m²` : ''}
+                            {Number.isFinite(Number(r.chainage_start)) ? ` · Ch ${Number(r.chainage_start).toFixed(3)}` : ''}
+                          </span>
+                        </span>
+                          <span
+                            className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold text-slate-900 [text-shadow:none]"
+                            style={{
+                              background:
+                                r.severity === 'High' ? '#ef4444' : r.severity === 'Medium' ? '#eab308' : '#16a34a',
+                              color: r.severity === 'Medium' ? '#0f172a' : '#fff',
+                            }}
+                          >
+                            {r.severity || 'Low'}
+                          </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Predicted */}
+              <div className="shrink-0 overflow-hidden rounded-2xl border border-white/10 bg-white/[0.04] p-2">
+                <div className="mb-1.5 flex shrink-0 items-center gap-1.5">
+                  <span className="text-cyan-300" aria-hidden>
+                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M3 17 L9 11 L13 15 L21 6" />
+                      <path d="M16 6 h5 v5" />
+                    </svg>
+                  </span>
+                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-cyan-300">
+                    Predicted distress
+                  </p>
+                  {chainageSlice.predicted.length > 0 && (
+                    <span className="shrink-0 rounded-full bg-black/40 px-1.5 text-[10px] font-bold text-white [text-shadow:none]">
+                      {chainageSlice.predicted.length}
+                    </span>
+                  )}
+                </div>
+                {chainageSlice.predicted.length === 0 ? (
+                  <p className="m-0 truncate px-1 text-[12px] text-slate-300">No prediction for this bin</p>
+                ) : (
+                  <div className="grid grid-cols-3 gap-x-2 gap-y-0.5 overflow-hidden">
+                    {chainageSlice.predicted.map((r, i) => (
+                      <button
+                        type="button"
+                        key={`pred-${i}`}
+                        onClick={() => locateDistress(r, 'predicted')}
+                        title="Locate in 3D"
+                        className={`flex w-full min-w-0 cursor-pointer items-center gap-1.5 rounded-lg px-1.5 py-0.5 text-left transition hover:bg-white/15 ${focusedDistress === r ? 'bg-white/20 ring-1 ring-cyan-300/80' : 'bg-transparent'}`}
+                      >
+                        <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-white">
+                          {r.distress_type || 'Distress'}
+                          <span className="ml-1.5 text-[11px] font-medium text-cyan-200">
+                            {String(r.direction || '').toLowerCase().startsWith('dec') ? '↘' : '↗'} {r.direction || '—'}
+                            {Number.isFinite(Number(r.chainage_start)) ? ` · Ch ${Number(r.chainage_start).toFixed(3)}` : ''}
+                          </span>
+                        </span>
+                          <span
+                            className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold text-slate-900 [text-shadow:none]"
+                            style={{
+                              background:
+                                r.severity === 'High' ? '#f472b6' : r.severity === 'Medium' ? '#a78bfa' : '#38bdf8',
+                            }}
+                          >
+                            {r.severity || 'Low'}
+                          </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {showGraphs && <CountTrendChart points={predictedTrend} color="#38bdf8" />}
+              </div>
+              <div className="shrink-0 overflow-hidden rounded-2xl border border-white/10 bg-white/[0.04] p-2">
+                <div className="mb-1.5 flex shrink-0 items-center gap-1.5">
+                  <span className="text-fuchsia-300" aria-hidden>
+                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M12 3 L21 8 L12 13 L3 8 Z" />
+                      <path d="M3 8 v8 l9 5 M21 8 v8 l-9 5 M12 13 v8" />
+                    </svg>
+                  </span>
+                  <p className="m-0 min-w-0 flex-1 truncate text-[12px] font-bold uppercase tracking-[0.1em] text-fuchsia-300">
+                    Inventory
+                  </p>
+                  {chainageSlice.inventoryPoints.length + chainageSlice.inventoryLines.length > 0 && (
+                    <span className="shrink-0 rounded-full bg-black/40 px-1.5 text-[10px] font-bold text-white [text-shadow:none]">
+                      {chainageSlice.inventoryPoints.length + chainageSlice.inventoryLines.length}
+                    </span>
+                  )}
+                </div>
+                {chainageSlice.inventoryPoints.length === 0 && chainageSlice.inventoryLines.length === 0 ? (
+                  <p className="m-0 truncate px-1 text-[12px] text-slate-300">No inventory in this bin</p>
+                ) : (
+                  <div className="grid grid-cols-3 gap-x-2 gap-y-0.5 overflow-hidden">
+                    {[
+                      ...chainageSlice.inventoryLines.map((name) => ({
+                        key: `line-${name}`,
+                        title: name,
+                        badge: 'Linear',
+                        sub: 'Covers this chainage',
+                      })),
+                      ...chainageSlice.inventoryPoints.map((g) => ({
+                        key: `pt-${g.asset}-${g.dir}`,
+                        title: g.asset,
+                        badge: `×${g.count}`,
+                        sub: g.dir || 'Point asset',
+                      })),
+                    ]
+                      .map((item) => (
+                        <div key={item.key} className="flex min-w-0 items-center gap-1.5 px-1.5 py-0.5">
+                          <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-white">
+                            {item.title}
+                            <span className="ml-1.5 text-[11px] font-medium text-slate-300">{item.sub}</span>
+                          </span>
+                          <span className="shrink-0 rounded-full bg-black/55 px-2 py-0.5 text-[11px] font-bold text-white">{item.badge}</span>
+                        </div>
+                      ))}
+                  </div>
+                )}
+              </div>
+          {selectedReported && (
+            <div className="pointer-events-auto shrink-0 overflow-hidden rounded-xl border border-white/15 bg-black/75 p-2 shadow-xl">
+              <div className="mb-2 flex items-start justify-between gap-2">
+                <div>
+                  <p className="m-0 text-[10px] font-semibold uppercase tracking-wide text-slate-400">Reported distress</p>
+                  <h3 className="m-0 text-[15px] font-semibold text-white">{selectedReported.distress_type || 'Distress'}</h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSelectedReported(null)}
+                  className="rounded-md px-1.5 py-0.5 text-[12px] text-slate-300 hover:bg-white/10 hover:text-white"
+                  title="Close"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="mb-2">
+                <span
+                  className="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-semibold text-white"
+                  style={{
+                    background:
+                      selectedReported.severity === 'High'
+                        ? '#ef4444'
+                        : selectedReported.severity === 'Medium'
+                          ? '#ca8a04'
+                          : '#16a34a',
+                  }}
+                >
+                  {selectedReported.severity || 'Low'}
+                </span>
+              </div>
+              <dl className="m-0 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12px]">
+                {[
+                  ['Chainage', `${selectedReported.chainage_start ?? '—'} – ${selectedReported.chainage_end ?? '—'} km`],
+                  ['Direction', selectedReported.direction || '—'],
+                  ['Pavement', selectedReported.pavement_type || '—'],
+                  ['Lane', selectedReported.lane || '—'],
+                  ['Area', selectedReported.area != null ? `${Number(selectedReported.area).toFixed(2)} m²` : '—'],
+                  ['Length', selectedReported.length != null ? `${Number(selectedReported.length).toFixed(2)} m` : '—'],
+                  ['Width', selectedReported.width != null ? `${Number(selectedReported.width).toFixed(2)} m` : '—'],
+                  ['Depth', selectedReported.depth != null ? `${Number(selectedReported.depth)}` : '—'],
+                  ['Date', selectedReported.date || '—'],
+                ].map(([k, v]) => (
+                  <div key={k} className="contents">
+                    <dt className="text-slate-400">{k}</dt>
+                    <dd className="m-0 font-medium text-slate-100">{v}</dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          )}
+            </div>
+          </div>
         )}
       </div>
     </div>

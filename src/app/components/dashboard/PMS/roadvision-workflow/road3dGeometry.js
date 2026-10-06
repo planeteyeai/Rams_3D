@@ -85,6 +85,31 @@ export function buildRibbonGeometry(points, leftM, rightM, y = 0.05) {
   return { positions, uvs, indices }
 }
 
+/** Join separate ribbons into one mesh so a dashed line is a single draw call. */
+export function mergeRibbonGeometries(geos) {
+  const parts = (geos || []).filter((g) => g?.positions?.length && g?.indices?.length)
+  if (!parts.length) return null
+  let vCount = 0
+  let iCount = 0
+  parts.forEach((g) => {
+    vCount += g.positions.length / 3
+    iCount += g.indices.length
+  })
+  const positions = new Float32Array(vCount * 3)
+  const uvs = new Float32Array(vCount * 2)
+  const indices = new Uint32Array(iCount)
+  let vOff = 0
+  let iOff = 0
+  parts.forEach((g) => {
+    positions.set(g.positions, vOff * 3)
+    uvs.set(g.uvs, vOff * 2)
+    for (let i = 0; i < g.indices.length; i++) indices[iOff + i] = g.indices[i] + vOff
+    vOff += g.positions.length / 3
+    iOff += g.indices.length
+  })
+  return { positions, uvs, indices }
+}
+
 /** Dash segments along a ribbon, interpolated in metres so sparse polylines still dash. */
 export function buildDashedRibbon(points, leftM, rightM, y = 0.06, dashLen = 4, gapLen = 6) {
   if (!points?.length || points.length < 2) return []
@@ -177,22 +202,33 @@ export function buildCorridorPolygons(coords, spec = ROAD_SPEC) {
 }
 
 /** Cumulative arc length (m) along centerline polyline. */
+const polylineMetricsCache = new WeakMap()
+
 export function polylineMetrics(points) {
+  const hit = polylineMetricsCache.get(points)
+  if (hit) return hit
   const cum = [0]
   for (let i = 1; i < points.length; i++) {
     cum.push(cum[i - 1] + Math.hypot(points[i].x - points[i - 1].x, points[i].z - points[i - 1].z))
   }
-  return { cumDist: cum, totalM: cum[cum.length - 1] || 0 }
+  const metrics = { cumDist: cum, totalM: cum[cum.length - 1] || 0 }
+  polylineMetricsCache.set(points, metrics)
+  return metrics
 }
 
 /** Sample position + tangent + left normal at distance `distM` along polyline. */
 export function sampleAtDistance(points, distM) {
   const { cumDist, totalM } = polylineMetrics(points)
   const d = Math.max(0, Math.min(distM, totalM))
-  let i = 1
-  while (i < cumDist.length && cumDist[i] < d) i++
-  const i0 = Math.max(0, i - 1)
-  const i1 = Math.min(points.length - 1, i)
+  let lo = 1
+  let hi = Math.max(1, cumDist.length - 1)
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1
+    if (cumDist[mid] < d) lo = mid + 1
+    else hi = mid
+  }
+  const i1 = Math.min(points.length - 1, lo)
+  const i0 = Math.max(0, i1 - 1)
   const seg = cumDist[i1] - cumDist[i0] || 1
   const t = (d - cumDist[i0]) / seg
   const a = points[i0]
