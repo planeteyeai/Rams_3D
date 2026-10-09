@@ -13,11 +13,11 @@ const TONE = { Good: 'pin-green', Fair: 'pin-amber', Poor: 'pin-rose', High: 'pi
 
 const samples = (p, reported) => (reported
   ? [['R1', 'Good'], ['R2', 'Fair'], ['R3', 'Poor'], ['R4', 'Fair'], ['R5', 'Good']]
-  : [['P1', 'Low'], ['P2', 'Med'], ['P3', 'High'], ['P4', 'Med'], ['P5', 'Low']]
+  : [['P1', ''], ['P2', ''], ['P3', ''], ['P4', ''], ['P5', '']]
 ).map(([code, status], i) => ({
   id: `${reported ? 'rep' : 'pred'}-${i}`,
   code,
-  name: `${reported ? 'Observed' : 'Predicted'} ${status}`,
+  name: reported ? `Observed ${status}` : `Predicted ${i + 1}`,
   place: `Ch ${(95 + i * 9).toFixed(0)}+000`,
   status,
   tone: TONE[status],

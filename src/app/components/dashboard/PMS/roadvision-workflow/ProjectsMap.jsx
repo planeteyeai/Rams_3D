@@ -339,10 +339,18 @@ export default function ProjectsMap({
       className: '',
       iconSize: [28, 28],
       iconAnchor: [14, 14],
-      html: `<div style="width:28px;height:28px;border-radius:999px;border:3px solid #fff;background:${snap.pathMode === 'lhs' ? '#22c55e' : snap.pathMode === 'rhs' ? '#3b82f6' : '#f59e0b'};box-shadow:0 2px 10px rgba(0,0,0,.35)"></div>`,
+      html: `<div style="width:28px;height:28px;border-radius:999px;border:3px solid #fff;background:${snap.pathMode === 'lhs' || snap.pathMode === 'sinc' ? '#22c55e' : snap.pathMode === 'rhs' || snap.pathMode === 'sdec' ? '#3b82f6' : '#f59e0b'};box-shadow:0 2px 10px rgba(0,0,0,.35)"></div>`,
     })
     snapPreview.current = L.marker([snap.lat, snap.lng], { icon, interactive: false, zIndexOffset: 2000 }).addTo(m)
-    const side = snap.pathMode === 'lhs' ? 'LHS' : snap.pathMode === 'rhs' ? 'RHS' : 'Median'
+    const side = snap.pathMode === 'lhs'
+      ? 'Increasing'
+      : snap.pathMode === 'rhs'
+        ? 'Decreasing'
+        : snap.pathMode === 'sinc'
+          ? 'S Increasing'
+          : snap.pathMode === 'sdec'
+            ? 'S Decreasing'
+            : 'Median'
     setPegHint(`${side} · Ch ${snap.chainageKm.toFixed(2)} km`)
     return snap
   }

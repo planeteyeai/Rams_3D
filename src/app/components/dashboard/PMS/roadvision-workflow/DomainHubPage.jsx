@@ -1,14 +1,76 @@
-import { Navigate, useNavigate } from 'react-router-dom'
+import { useEffect, useMemo } from 'react'
+import { Navigate, useNavigate, useOutletContext } from 'react-router-dom'
 import WorkflowShell from './WorkflowShell'
 import NodeCard from './NodeCard'
 import { GraphLayout } from './ConnectorLayouts'
 import { IconBituminous, IconConcrete, IconInventory, IconPms, IconRoad, IconTraffic } from './Icons'
 import { setStoredPavementType, useWorkflow } from './constants'
+import NanasaRoad3DModal from './NanasaRoad3DModal'
+import invData from '../../../../../assets/data/adani-inventory.json'
+import pmsData from '../../../../../assets/data/adani-pms.json'
+
+const NANASA_ID = 'adani-nanasa-nprpl'
+const NANASA_NAME = 'ADANI-NANASA (NPRPL)'
+
+function colorOf(asset) {
+  return invData.types.find((t) => t.id === asset)?.color || '#64748b'
+}
+
+function NanasaDirect3D() {
+  const nav = useNavigate()
+  const { setHideHeader } = useOutletContext()
+  useEffect(() => {
+    setHideHeader(true)
+    return () => setHideHeader(false)
+  }, [setHideHeader])
+
+  const date = invData.dates?.[0] || ''
+  const inventoryPoints = useMemo(() => invData.points.filter((r) => {
+    if (r.project !== NANASA_NAME) return false
+    if (date && r.date !== date) return false
+    return true
+  }).map((r) => ({
+    ...r,
+    id: String(r.i),
+    color: colorOf(r.asset),
+    name: r.sub ? `${r.asset} (${r.sub})` : r.asset,
+  })), [date])
+
+  const inventoryLines = useMemo(() => invData.lines.filter((r) => !date || r.date === date).map((r) => ({
+    ...r,
+    id: String(r.i),
+    color: colorOf(r.asset),
+    name: r.sub ? `${r.asset} (${r.sub})` : r.asset,
+  })), [date])
+
+  const pavementRecords = useMemo(() => {
+    const latest = pmsData.dates?.[0]
+    return pmsData.records.filter((r) => {
+      if (r.project !== NANASA_NAME) return false
+      if (latest && r.date !== latest) return false
+      return true
+    })
+  }, [])
+
+  return (
+    <div className="relative h-full min-h-0 w-full">
+      <NanasaRoad3DModal
+        open
+        onClose={() => nav('/')}
+        inventoryPoints={inventoryPoints}
+        inventoryLines={inventoryLines}
+        pavementRecords={pavementRecords}
+        pavementDate={pmsData.dates?.[0] || ''}
+      />
+    </div>
+  )
+}
 
 export default function DomainHubPage() {
   const nav = useNavigate()
   const { redirect, project, base } = useWorkflow()
   if (redirect) return <Navigate to={redirect} replace />
+  if (project.id === NANASA_ID) return <NanasaDirect3D />
   const pick = (type) => { setStoredPavementType(type); nav(`${base}/pms/${type}`) }
 
   return (

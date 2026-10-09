@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { Link, Navigate } from 'react-router-dom'
+import { useEffect, useMemo, useState } from 'react'
+import { Link, Navigate, useOutletContext } from 'react-router-dom'
 import ProjectsMap from './ProjectsMap'
 import { IconBack } from './Icons'
 import { useWorkflow } from './constants'
@@ -74,6 +74,11 @@ export default function InventoryHubPage() {
   const [asset, setAsset] = useState('all')
   const [activeId, setActiveId] = useState(null)
   const [hideHud, setHideHud] = useState(false)
+  const { setHideHeader } = useOutletContext()
+  useEffect(() => {
+    setHideHeader(hideHud)
+    return () => setHideHeader(false)
+  }, [hideHud, setHideHeader])
   const dirs = useMemo(() => {
     const seen = new Set([...invData.points, ...invData.lines].map((r) => r.dir).filter(Boolean))
     return ['Increasing', 'Decreasing', 'Median'].filter((d) => seen.has(d)).concat([...seen].filter((d) => !['Increasing', 'Decreasing', 'Median'].includes(d)))

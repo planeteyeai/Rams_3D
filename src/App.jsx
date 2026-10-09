@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 
 const tab = (on) => `relative rounded-lg px-3 py-2 text-sm font-medium no-underline transition ${on ? 'text-indigo-950 after:absolute after:inset-x-2 after:bottom-0 after:h-1 after:rounded-full after:bg-indigo-600' : 'text-slate-500 hover:bg-indigo-50 hover:text-indigo-800'}`
@@ -5,9 +6,11 @@ const tab = (on) => `relative rounded-lg px-3 py-2 text-sm font-medium no-underl
 export default function App() {
   const { pathname } = useLocation()
   const onWorkflow = pathname === '/' || pathname.startsWith('/workflow')
+  const [hideHeader, setHideHeader] = useState(false)
 
   return (
     <div className="flex h-svh max-h-svh flex-col overflow-hidden bg-canvas text-ink">
+      {!hideHeader && (
       <header className="z-20 shrink-0 border-b border-indigo-100 bg-white/95 backdrop-blur">
         <div className="mx-auto flex h-14 w-[min(1280px,calc(100%-2rem))] items-center justify-between gap-4">
           <NavLink to="/" className="group flex items-center gap-2.5 text-indigo-950 no-underline">
@@ -30,8 +33,9 @@ export default function App() {
           </div>
         </div>
       </header>
+      )}
       <main className="dot-grid flex min-h-0 flex-1 flex-col overflow-hidden">
-        <Outlet />
+        <Outlet context={{ setHideHeader }} />
       </main>
     </div>
   )

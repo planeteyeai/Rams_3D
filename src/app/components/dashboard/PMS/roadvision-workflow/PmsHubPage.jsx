@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { Link, Navigate, useNavigate } from 'react-router-dom'
+import { useEffect, useMemo, useState } from 'react'
+import { Link, Navigate, useNavigate, useOutletContext } from 'react-router-dom'
 import ProjectsMap from './ProjectsMap'
 import { IconBack } from './Icons'
 import { setStoredPavementType, useWorkflow } from './constants'
@@ -110,6 +110,11 @@ export default function PmsHubPage() {
   const [lane, setLane] = useState('all')
   const [activeId, setActiveId] = useState(null)
   const [hideHud, setHideHud] = useState(false)
+  const { setHideHeader } = useOutletContext()
+  useEffect(() => {
+    setHideHeader(hideHud)
+    return () => setHideHeader(false)
+  }, [hideHud, setHideHeader])
 
   const corridor = useMemo(() => {
     const name = project?.name

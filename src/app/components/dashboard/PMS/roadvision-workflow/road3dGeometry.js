@@ -254,12 +254,13 @@ export function sampleChainageShoulder(points, chainageKm, minKm, maxKm, side, s
   const distM = ((chainageKm - minKm) / span) * totalM
   const s = sampleAtDistance(points, distM)
   const mode = String(side || 'median').toLowerCase()
-  // Side offset (left/right when looking along increasing)
+  // Side offset (left/right when looking along increasing).
+  // sinc / sdec ride the service road on the same sides as Increasing / Decreasing.
   let sign = 0
-  if (mode === 'lhs' || mode === 'inc' || mode === 'increasing') sign = -1
-  else if (mode === 'rhs' || mode === 'dec' || mode === 'decreasing') sign = 1
+  if (mode === 'lhs' || mode === 'inc' || mode === 'increasing' || mode === 'sinc') sign = -1
+  else if (mode === 'rhs' || mode === 'dec' || mode === 'decreasing' || mode === 'sdec') sign = 1
   // Travel facing along the selected path
-  const reverse = mode === 'rhs' || mode === 'dec' || mode === 'decreasing'
+  const reverse = mode === 'rhs' || mode === 'dec' || mode === 'decreasing' || mode === 'sdec'
   const yaw = reverse
     ? Math.atan2(-s.tx, -s.tz)
     : Math.atan2(s.tx, s.tz)
@@ -321,7 +322,13 @@ export function snapLatLngToRoad(lat, lng, coords, minKm, maxKm, maxDistM = 150)
 
   const s = sampleAtDistance(points, cumDist[bestI])
   const sideDot = (loc.x - s.x) * s.nx + (loc.z - s.z) * s.nz
-  const pathMode = Math.abs(sideDot) < 1.2 ? 'median' : sideDot >= 0 ? 'rhs' : 'lhs'
+  // Main carriageway stays inside ~12 m; farther out is the service road.
+  const onService = Math.abs(sideDot) >= 14
+  const pathMode = Math.abs(sideDot) < 1.2
+    ? 'median'
+    : sideDot >= 0
+      ? (onService ? 'sdec' : 'rhs')
+      : (onService ? 'sinc' : 'lhs')
   const span = maxKm - minKm || 1
   const chainageKm = minKm + (cumDist[bestI] / totalM) * span
   return {
@@ -337,6 +344,6 @@ export function snapLatLngToRoad(lat, lng, coords, minKm, maxKm, maxDistM = 150)
 export function scrubTFromChainage(chainageKm, pathMode, minKm, maxKm) {
   const span = maxKm - minKm || 1
   const km = Math.max(minKm, Math.min(maxKm, Number(chainageKm) || minKm))
-  if (pathMode === 'rhs') return Math.max(0, Math.min(1, (maxKm - km) / span))
+  if (pathMode === 'rhs' || pathMode === 'sdec') return Math.max(0, Math.min(1, (maxKm - km) / span))
   return Math.max(0, Math.min(1, (km - minKm) / span))
 }

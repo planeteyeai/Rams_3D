@@ -83,6 +83,45 @@ function chainageWindow(km, lengthM = 10) {
   return { start: round(startRaw), end: round(endRaw), lengthM: Math.round(lenKm * 1000) }
 }
 
+function formatAheadDistance(meters) {
+  if (!Number.isFinite(meters) || meters < 1) return 'Here'
+  if (meters < 1000) return `${Math.round(meters)} m`
+  const km = meters / 1000
+  return km >= 10 ? `${km.toFixed(1)} km` : `${km.toFixed(2)} km`
+}
+
+/** Next reported distress ahead on the selected path. Distance 0 means it overlaps this chainage. */
+function upcomingDistress(records, km, mode, filter) {
+  if (!records?.length || filter === 'off' || !Number.isFinite(Number(km))) return null
+  const reverse = pathTravelsDecreasing(mode)
+  let best = null
+  let bestDist = Infinity
+  records.forEach((r) => {
+    if (!matchesPathRoad(r, mode)) return
+    if (mode !== 'median' && !matchesPathDir(r.direction, mode)) return
+    const sev = String(r.severity || 'low').toLowerCase()
+    if (filter !== 'all' && sev !== filter) return
+    const start = Number(r.chainage_start)
+    const end = Number(r.chainage_end ?? start)
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return
+    let distKm
+    if (km >= Math.min(start, end) && km <= Math.max(start, end)) distKm = 0
+    else if (!reverse) {
+      if (start <= km) return
+      distKm = start - km
+    } else {
+      if (end >= km) return
+      distKm = km - end
+    }
+    if (distKm < bestDist) {
+      bestDist = distKm
+      best = r
+    }
+  })
+  if (!best) return { none: true }
+  return { record: best, meters: bestDist * 1000 }
+}
+
 function formatWindowKm(n, lengthM) {
   if (lengthM >= 1000) return Number(n).toFixed(0)
   if (lengthM >= 100) return Number(n).toFixed(1)
@@ -116,11 +155,29 @@ function dirSideSign(dir, fallback = SIDE_LHS) {
   return fallback
 }
 
+/** Service-road paths: same sides as Increasing (LHS) and Decreasing (RHS). */
+function isServicePath(pathMode) {
+  return pathMode === 'sinc' || pathMode === 'sdec'
+}
+
+/** Decreasing paths travel from the end of the corridor back toward the start. */
+function pathTravelsDecreasing(pathMode) {
+  return pathMode === 'rhs' || pathMode === 'sdec'
+}
+
 /** Side the selected path travels on (0 = median, i.e. both carriageways). */
 function pathModeSideSign(pathMode) {
-  if (pathMode === 'lhs') return SIDE_LHS
-  if (pathMode === 'rhs') return SIDE_RHS
+  if (pathMode === 'lhs' || pathMode === 'sinc') return SIDE_LHS
+  if (pathMode === 'rhs' || pathMode === 'sdec') return SIDE_RHS
   return 0
+}
+
+/** Main-carriageway paths hide service-road rows, and the reverse. Median shows both. */
+function matchesPathRoad(record, pathMode) {
+  const road = String(record?.road || '').toLowerCase()
+  if (isServicePath(pathMode)) return road === 'service'
+  if (pathMode === 'median') return true
+  return road !== 'service'
 }
 
 /** Which carriageway a lat/lng falls on, for records that carry no `dir`. */
@@ -139,6 +196,70 @@ function matchesPathDir(direction, pathMode) {
   if (d.startsWith('inc')) return want === SIDE_LHS
   if (d.startsWith('dec')) return want === SIDE_RHS
   return false
+}
+
+/** Service-road segments in travel order: Increasing low→high, Decreasing high→low. */
+function serviceSegmentsForPath(pathMode) {
+  const reverse = pathTravelsDecreasing(pathMode)
+  return SERVICE_SEGMENTS
+    .map((s) => ({ start: Number(s.start), end: Number(s.end), dir: s.dir }))
+    .filter((s) => Number.isFinite(s.start) && Number.isFinite(s.end) && s.end > s.start && matchesPathDir(s.dir, pathMode))
+    .sort((a, b) => (reverse ? b.end - a.end : a.start - b.start))
+}
+
+function servicePathLengthKm(pathMode) {
+  return serviceSegmentsForPath(pathMode).reduce((n, s) => n + (s.end - s.start), 0)
+}
+
+/** Scrubber position for a chainage. Service paths snap onto the nearest real segment. */
+function scrubTFromChainageKm(mode, km) {
+  const span = CHAINAGE_MAX_KM - CHAINAGE_MIN_KM || 1
+  const clamped = Math.max(CHAINAGE_MIN_KM, Math.min(CHAINAGE_MAX_KM, Number(km)))
+  const linear = pathTravelsDecreasing(mode)
+    ? (CHAINAGE_MAX_KM - clamped) / span
+    : (clamped - CHAINAGE_MIN_KM) / span
+  if (!isServicePath(mode)) return Math.max(0, Math.min(1, linear))
+  const segs = serviceSegmentsForPath(mode)
+  const total = segs.reduce((n, s) => n + (s.end - s.start), 0)
+  if (!total) return Math.max(0, Math.min(1, linear))
+  const reverse = pathTravelsDecreasing(mode)
+  let acc = 0
+  let bestT = 0
+  let bestDist = Infinity
+  segs.forEach((s) => {
+    const len = s.end - s.start
+    const point = Math.max(s.start, Math.min(s.end, clamped))
+    const dist = Math.abs(clamped - point)
+    const along = reverse ? s.end - point : point - s.start
+    if (dist < bestDist - 1e-6) {
+      bestDist = dist
+      bestT = (acc + along) / total
+    }
+    acc += len
+  })
+  return Math.max(0, Math.min(1, bestT))
+}
+
+/** Chainage along the selected path. Service paths only visit chainages that have a service road. */
+function chainageKmFromScrubT(mode, t) {
+  const clamped = Math.max(0, Math.min(1, Number(t) || 0))
+  const span = CHAINAGE_MAX_KM - CHAINAGE_MIN_KM || 1
+  const linear = pathTravelsDecreasing(mode)
+    ? CHAINAGE_MAX_KM - clamped * span
+    : CHAINAGE_MIN_KM + clamped * span
+  if (!isServicePath(mode)) return linear
+  const segs = serviceSegmentsForPath(mode)
+  const total = segs.reduce((n, s) => n + (s.end - s.start), 0)
+  if (!total) return linear
+  let remain = clamped * total
+  const reverse = pathTravelsDecreasing(mode)
+  for (const s of segs) {
+    const len = s.end - s.start
+    if (remain <= len + 1e-9) return reverse ? s.end - remain : s.start + remain
+    remain -= len
+  }
+  const last = segs[segs.length - 1]
+  return reverse ? last.start : last.end
 }
 
 /** Dense frames along median between chainages — uses full-polyline tangents/normals. */
@@ -317,6 +438,141 @@ function addPavementIri(root, medianPts, origin, records) {
   return layer
 }
 
+const iriLabelTex = new Map()
+
+/** One road-paint caption, scaled so every character stays inside the marking. */
+function iriRoadLabelTexture(lines) {
+  const key = lines.join('\n')
+  const cached = iriLabelTex.get(key)
+  if (cached) return cached
+  const c = document.createElement('canvas')
+  c.width = 1024
+  c.height = lines.length > 1 ? 440 : 240
+  const ctx = c.getContext('2d')
+  ctx.clearRect(0, 0, c.width, c.height)
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.lineJoin = 'round'
+  ctx.strokeStyle = '#0b1220'
+  ctx.fillStyle = '#f8fafc'
+  const paintLine = (text, y) => {
+    const maxW = c.width - 72
+    let size = 168
+    ctx.font = `900 ${size}px "Arial Black", Impact, sans-serif`
+    const measured = ctx.measureText(text).width
+    if (measured > maxW) size = Math.max(64, Math.floor(size * (maxW / measured)))
+    ctx.font = `900 ${size}px "Arial Black", Impact, sans-serif`
+    ctx.lineWidth = Math.max(12, size * 0.16)
+    ctx.strokeText(text, c.width / 2, y)
+    ctx.fillText(text, c.width / 2, y)
+  }
+  if (lines.length === 1) paintLine(lines[0], c.height / 2)
+  else lines.forEach((line, i) => paintLine(line, ((i + 0.5) / lines.length) * c.height))
+  const tex = new THREE.CanvasTexture(c)
+  tex.colorSpace = THREE.SRGBColorSpace
+  tex.anisotropy = 8
+  sharedTextures.add(tex)
+  iriLabelTex.set(key, tex)
+  return tex
+}
+
+/** One caption per lane at this chainage, so each value sits on its own lane. */
+function iriCaptionsAt(records, km, mode, filter) {
+  const sideMode = mode === 'median' ? 'lhs' : mode
+  const side = pathModeSideSign(sideMode) || SIDE_LHS
+  return ['L1', 'L2'].map((lane) => {
+    const row = (records || []).find((r) => {
+      if (!(km >= Number(r.start) && km < Number(r.end))) return false
+      if (String(r.lane || '').toUpperCase() !== lane) return false
+      if (!matchesPathDir(r.direction, sideMode)) return false
+      const band = iriBand(r)
+      if (band === 'na') return false
+      if (filter && filter !== 'all' && band !== filter) return false
+      return true
+    })
+    if (!row) return null
+    return {
+      lane,
+      text: `${lane} ${Math.round(Number(row.iri) * 1000)} ${iriBandLabel(iriBand(row)).toUpperCase()}`,
+      side,
+    }
+  }).filter(Boolean)
+}
+
+function ensureLaneLabel(layer, lane) {
+  const mesh = new THREE.Mesh(
+    new THREE.PlaneGeometry(2.35, 0.72),
+    new THREE.MeshBasicMaterial({
+      transparent: true,
+      depthWrite: false,
+      polygonOffset: true,
+      polygonOffsetFactor: -4,
+      polygonOffsetUnits: -4,
+    }),
+  )
+  mesh.matrixAutoUpdate = false
+  mesh.renderOrder = 7
+  mesh.userData.iriLabel = true
+  mesh.userData.lane = lane
+  layer.add(mesh)
+  return mesh
+}
+
+/** Slide one small caption along each lane. `placeKm` sets where it sits; `dataKm` is the green highlight. */
+function syncIriRoadLabel(rt, placeKm, dataKm) {
+  const layer = rt?.pavementLayer
+  if (!layer) return
+  if (rt.iriLabel) {
+    layer.remove(rt.iriLabel)
+    rt.iriLabel.geometry?.dispose()
+    rt.iriLabel.material?.dispose()
+    rt.iriLabel = null
+  }
+  if (!rt.iriLabels) rt.iriLabels = {}
+  ;['L1', 'L2'].forEach((lane) => {
+    if (!rt.iriLabels[lane]) rt.iriLabels[lane] = ensureLaneLabel(layer, lane)
+  })
+  const paint = rt.iriPaint
+  const readKm = Number.isFinite(Number(dataKm)) ? Number(dataKm) : placeKm
+  const captions = paint && rt.points?.length && paint.filter !== 'off' && Number.isFinite(Number(readKm))
+    ? iriCaptionsAt(paint.records, readKm, paint.mode, paint.filter)
+    : []
+  const byLane = Object.fromEntries(captions.map((c) => [c.lane, c]))
+  const half = ROAD_SPEC.medianWidthM / 2
+  const laneW = ROAD_SPEC.laneWidthM
+  ;['L1', 'L2'].forEach((lane) => {
+    const mesh = rt.iriLabels[lane]
+    const info = byLane[lane]
+    if (!info) {
+      mesh.visible = false
+      return
+    }
+    mesh.visible = true
+    if (mesh.userData.key !== info.text) {
+      mesh.material.map = iriRoadLabelTexture([info.text])
+      mesh.material.needsUpdate = true
+      mesh.userData.key = info.text
+    }
+    const f = chainageFrame(rt.points, placeKm)
+    const travel = info.side < 0 ? 1 : -1
+    const fx = f.tx * travel
+    const fz = f.tz * travel
+    const laneOff = half + laneW * (lane === 'L2' ? 1.5 : 0.5)
+    const closerM = 11
+    mesh.matrix.makeBasis(
+      new THREE.Vector3(f.nx * travel, 0, f.nz * travel),
+      new THREE.Vector3(fx, 0, fz),
+      new THREE.Vector3(0, 1, 0),
+    )
+    mesh.matrix.setPosition(
+      f.x + f.nx * laneOff * info.side - fx * closerM,
+      0.12,
+      f.z + f.nz * laneOff * info.side - fz * closerM,
+    )
+    mesh.matrixWorldNeedsUpdate = true
+  })
+}
+
 function applyPavementFilter(layer, filter, concreteLayer) {
   const mode = filter || 'all'
   const off = mode === 'off'
@@ -329,6 +585,7 @@ function applyPavementFilter(layer, filter, concreteLayer) {
   }
   layer.visible = true
   layer.children.forEach((mesh) => {
+    if (mesh.userData?.iriLabel) return
     const band = mesh.userData?.iriBand
     mesh.visible = mode === 'all' || band === mode
   })
@@ -343,9 +600,10 @@ function placeDistressRecord(r, origin, medianPts) {
   }
   const f = recordFrame(medianPts, r.chainage_start, r.chainage_end, loc)
   const sign = dirSideSign(r.direction)
+  const off = String(r.road || '').toLowerCase() === 'service' ? SERVICE_ROAD_CENTRE_M : DISTRESS_LANE_M
   return {
-    x: f.x + f.nx * DISTRESS_LANE_M * sign,
-    z: f.z + f.nz * DISTRESS_LANE_M * sign,
+    x: f.x + f.nx * off * sign,
+    z: f.z + f.nz * off * sign,
     severity: sev,
     type: r.distress_type || '',
     yaw: Math.atan2(f.tx, f.tz),
@@ -527,35 +785,6 @@ function applyDistressFilter(layer, filter) {
   })
 }
 
-function makeScrubberMarker(color, labelMat) {
-  const g = new THREE.Group()
-  const ring = new THREE.Mesh(
-    new THREE.RingGeometry(0.55, 0.85, 24),
-    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.55, side: THREE.DoubleSide }),
-  )
-  ring.rotation.x = -Math.PI / 2
-  ring.position.y = 0.04
-  g.add(ring)
-  const pole = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.06, 0.08, 2.2, 8),
-    new THREE.MeshStandardMaterial({ color: 0x455a64, metalness: 0.5, roughness: 0.4 }),
-  )
-  pole.position.y = 1.1
-  g.add(pole)
-  const head = new THREE.Mesh(
-    new THREE.SphereGeometry(0.35, 12, 10),
-    new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.35, roughness: 0.35 }),
-  )
-  head.position.y = 2.35
-  g.add(head)
-  const flag = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.5, 0.04), labelMat)
-  flag.position.set(0.55, 2.1, 0)
-  g.add(flag)
-  g.traverse((o) => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true } })
-  return g
-}
-
-/** Clear highlight children and dispose GPU resources. */
 function clearHighlightLayer(layer) {
   if (!layer) return
   while (layer.children.length) {
@@ -595,8 +824,8 @@ function addBasicRibbon(layer, framesOrPoints, left, right, y, color, opacity) {
 }
 
 /**
- * Paint the active 10 m chainage window on the carriageway matching path mode
- * (LHS / RHS / both for Median) — same bin as the info cards.
+ * Outline the active chainage window with a red border on the carriageway
+ * matching path mode — same bin as the info cards.
  */
 function updateChainageHighlight(layer, medianPts, winStart, winEnd, mode) {
   clearHighlightLayer(layer)
@@ -606,18 +835,53 @@ function updateChainageHighlight(layer, medianPts, winStart, winEnd, mode) {
 
   const half = ROAD_SPEC.medianWidthM / 2
   const outer = half + ROAD_SPEC.laneWidthM * ROAD_SPEC.lanesIncreasing
-  const color = mode === 'lhs' ? 0x34d399 : mode === 'rhs' ? 0x60a5fa : 0xfbbf24
-  // Inset slightly so the patch sits inside the white edge / median kerb
   const inset = 0.22
+  const border = 0xef4444
+  const thick = 0.16
+  const paint = (framesToPaint, left, right) => {
+    if (!framesToPaint || framesToPaint.length < 2) return
+    addBasicRibbon(layer, framesToPaint, left, left + thick, 0.1, border, 1)
+    addBasicRibbon(layer, framesToPaint, right - thick, right, 0.1, border, 1)
+    const cap = (frame, sign) => {
+      const tx = frame.nz * sign
+      const tz = -frame.nx * sign
+      addBasicRibbon(
+        layer,
+        [
+          frame,
+          { x: frame.x + tx * thick, z: frame.z + tz * thick, nx: frame.nx, nz: frame.nz },
+        ],
+        left,
+        right,
+        0.1,
+        border,
+        1,
+      )
+    }
+    cap(framesToPaint[0], 1)
+    cap(framesToPaint[framesToPaint.length - 1], -1)
+  }
+
+  if (isServicePath(mode)) {
+    const halfW = SERVICE_ROAD_WIDTH_M / 2 - inset
+    const centre = SERVICE_ROAD_CENTRE_M * (mode === 'sinc' ? -1 : 1)
+    const left = centre - halfW
+    const right = centre + halfW
+    SERVICE_SEGMENTS.forEach((seg) => {
+      if (!matchesPathDir(seg.dir, mode)) return
+      const a = Math.max(winStart, Number(seg.start))
+      const b = Math.min(winEnd, Number(seg.end))
+      if (!(a < b)) return
+      paint(sliceMedianFrames(medianPts, a, b, 1), left, right)
+    })
+    return
+  }
+
   const lhsBand = [-(outer - inset), -(half + inset)]
   const rhsBand = [half + inset, outer - inset]
   const bands = mode === 'lhs' ? [lhsBand] : mode === 'rhs' ? [rhsBand] : [lhsBand, rhsBand]
 
-  bands.forEach(([left, right]) => {
-    addBasicRibbon(layer, frames, left, right, 0.085, color, 0.5)
-    addBasicRibbon(layer, frames, left - 0.06, left + 0.06, 0.1, 0xffffff, 0.9)
-    addBasicRibbon(layer, frames, right - 0.06, right + 0.06, 0.1, 0xffffff, 0.9)
-  })
+  bands.forEach(([left, right]) => paint(frames, left, right))
 }
 
 const ASPHALT = 0x2b2d31
@@ -2782,42 +3046,215 @@ function latLngAtKm(km) {
   return [lat0 + (lat1 - lat0) * t, lng0 + (lng1 - lng0) * t]
 }
 
-/** Small map of the corridor with a marker on the chainage the 3D view is showing. */
-function CorridorLocationMap({ km, winStart, winEnd }) {
+const IRI_MAP_COLORS = {
+  good: '#16a34a',
+  fair: '#facc15',
+  poor: '#ef4444',
+  na: '#94a3b8',
+}
+
+/** One IRI run per lane, kept separate so L1 and L2 are not collapsed onto the centreline. */
+function iriRunsForMap(records, mode) {
+  const bins = new Map()
+  ;(records || []).forEach((r) => {
+    if (mode !== 'median' && !matchesPathDir(r.direction, mode)) return
+    const lane = String(r.lane || '').toUpperCase()
+    if (lane !== 'L1' && lane !== 'L2') return
+    const start = Number(r.start)
+    const end = Number(r.end)
+    if (!(end > start)) return
+    const side = dirSideSign(r.direction)
+    const band = iriBand(r)
+    const key = `${side}|${lane}|${start.toFixed(3)}`
+    bins.set(key, { start, end, band, lane, side })
+  })
+  const runs = []
+  ;[...bins.values()]
+    .sort((a, b) => a.side - b.side || a.lane.localeCompare(b.lane) || a.start - b.start)
+    .forEach((it) => {
+      const last = runs[runs.length - 1]
+      if (
+        last &&
+        last.side === it.side &&
+        last.lane === it.lane &&
+        last.band === it.band &&
+        it.start <= last.end + 0.02
+      ) {
+        last.end = Math.max(last.end, it.end)
+        return
+      }
+      runs.push({ ...it })
+    })
+  return runs
+}
+
+/** Metres from the median centreline to the middle of a lane. L1 is the inner lane. */
+function laneOffsetM(lane) {
+  const half = ROAD_SPEC.medianWidthM / 2
+  const w = ROAD_SPEC.laneWidthM
+  return lane === 'L2' ? half + w * 1.5 : half + w * 0.5
+}
+
+/** Point on a lane: same side offset the 3D road uses (Increasing left, Decreasing right). */
+function laneLatLng(km, sideSign, offsetM) {
+  const [lat, lng] = latLngAtKm(km)
+  const [lat2, lng2] = latLngAtKm(km + 0.02)
+  const cos = Math.cos((lat * Math.PI) / 180)
+  const east = (lng2 - lng) * 111320 * cos
+  const north = (lat2 - lat) * 110540
+  const len = Math.hypot(east, north) || 1
+  const tx = east / len
+  const tz = -north / len
+  const nEast = -tz
+  const nNorth = -tx
+  const e = nEast * offsetM * sideSign
+  const n = nNorth * offsetM * sideSign
+  return [lat + n / 110540, lng + e / (111320 * cos)]
+}
+
+function lanePoints(startKm, endKm, sideSign, offsetM) {
+  const a = Math.min(Number(startKm), Number(endKm))
+  const b = Math.max(Number(startKm), Number(endKm))
+  if (!(b > a)) return [laneLatLng(a, sideSign, offsetM)]
+  const pts = []
+  for (let k = a; k < b - 1e-6; k += 0.05) pts.push(laneLatLng(Math.min(k, b), sideSign, offsetM))
+  pts.push(laneLatLng(b, sideSign, offsetM))
+  return pts
+}
+
+/** Closed ring around one carriageway for the active chainage window. */
+function carriageOutline(startKm, endKm, sideSign) {
+  const half = ROAD_SPEC.medianWidthM / 2
+  const outer = half + ROAD_SPEC.laneWidthM * ROAD_SPEC.lanesIncreasing
+  const outside = lanePoints(startKm, endKm, sideSign, outer)
+  const inside = lanePoints(startKm, endKm, sideSign, half).slice().reverse()
+  if (outside.length < 2 || inside.length < 2) return null
+  return [...outside, ...inside]
+}
+
+/** Bearing of travel at a chainage, degrees clockwise from north. */
+function travelBearingDeg(km, pathMode) {
+  const step = pathTravelsDecreasing(pathMode) ? -0.05 : 0.05
+  const [lat1, lng1] = latLngAtKm(km)
+  const [lat2, lng2] = latLngAtKm(Number(km) + step)
+  const dLng = (lng2 - lng1) * Math.cos((lat1 * Math.PI) / 180)
+  const dLat = lat2 - lat1
+  if (Math.hypot(dLng, dLat) < 1e-9) return 0
+  return (Math.atan2(dLng, dLat) * 180) / Math.PI
+}
+
+function hereArrowIcon(deg) {
+  const rot = Number.isFinite(deg) ? deg.toFixed(1) : '0'
+  return L.divIcon({
+    className: 'nanasa-here-arrow',
+    iconSize: [42, 42],
+    iconAnchor: [21, 21],
+    html: `<div style="width:42px;height:42px;transform:rotate(${rot}deg);transform-origin:50% 50%;filter:drop-shadow(0 1px 2px rgba(0,0,0,.65))">
+      <svg viewBox="0 0 64 64" width="42" height="42" aria-hidden="true">
+        <path d="M32 6 L56 56 L32 44 L8 56 Z" fill="#ffffff" stroke="#2563eb" stroke-width="3.2" stroke-linejoin="round" stroke-linecap="round"/>
+      </svg>
+    </div>`,
+  })
+}
+
+function latLngToTileXY(lat, lng, z) {
+  const n = 2 ** z
+  const x = Math.floor(((lng + 180) / 360) * n)
+  const r = (lat * Math.PI) / 180
+  const y = Math.floor(((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * n)
+  return [x, y]
+}
+
+const TILE_WARM = new Set()
+const TILE_WARM_IMGS = []
+
+function warmGoogleTile(x, y, z) {
+  const n = 2 ** z
+  if (x < 0 || y < 0 || x >= n || y >= n) return
+  const url = `https://mt${(x + y) & 3}.google.com/vt/lyrs=s&x=${x}&y=${y}&z=${z}`
+  if (TILE_WARM.has(url)) return
+  TILE_WARM.add(url)
+  const img = new Image()
+  img.decoding = 'async'
+  img.onload = img.onerror = () => {
+    const i = TILE_WARM_IMGS.indexOf(img)
+    if (i >= 0) TILE_WARM_IMGS.splice(i, 1)
+  }
+  TILE_WARM_IMGS.push(img)
+  if (TILE_WARM_IMGS.length > 140) TILE_WARM_IMGS.splice(0, TILE_WARM_IMGS.length - 140)
+  img.src = url
+}
+
+/** Cache satellite tiles ahead of the arrow so the next stretch is ready before it pans in. */
+function prefetchCorridorTiles(map, km, pathMode) {
+  const z = map.getZoom()
+  if (!Number.isFinite(z)) return
+  const dir = pathTravelsDecreasing(pathMode) ? -1 : 1
+  const base = Number(km)
+  const levels = [
+    { zoom: z, reach: 3, step: 0.12, pad: 1 },
+    { zoom: Math.min(20, z + 1), reach: 1.2, step: 0.08, pad: 1 },
+  ]
+  levels.forEach(({ zoom, reach, step, pad }) => {
+    for (let d = -0.4; d <= reach + 1e-6; d += step) {
+      const at = Math.max(CHAINAGE_MIN_KM, Math.min(CHAINAGE_MAX_KM, base + d * dir))
+      const [lat, lng] = latLngAtKm(at)
+      const [x, y] = latLngToTileXY(lat, lng, zoom)
+      for (let dx = -pad; dx <= pad; dx++) {
+        for (let dy = -pad; dy <= pad; dy++) warmGoogleTile(x + dx, y + dy, zoom)
+      }
+    }
+  })
+}
+
+/** Small map of the corridor. The road is coloured by IRI: good, fair, or poor. */
+function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
   const wrap = useRef(null)
   const mapRef = useRef(null)
   const markerRef = useRef(null)
   const windowRef = useRef(null)
+  const iriLayerRef = useRef(null)
+  const poseRef = useRef({ km, pathMode })
+  poseRef.current = { km, pathMode }
 
   useEffect(() => {
     const el = wrap.current
     if (!el) return undefined
-    const line = (medianData.coordinates || []).map(([lng, lat]) => [lat, lng])
-    const m = L.map(el, { zoomControl: false, attributionControl: false, scrollWheelZoom: true })
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(m)
-    if (line.length > 1) {
-      L.polyline(line, { color: '#f59e0b', weight: 4, opacity: 0.9 }).addTo(m)
-    }
+    const m = L.map(el, { zoomControl: false, attributionControl: true, scrollWheelZoom: true })
+    L.tileLayer('https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+      maxZoom: 20,
+      subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+      attribution: '&copy; Google',
+      keepBuffer: 4,
+      updateWhenIdle: false,
+      updateInterval: 80,
+    }).addTo(m)
     const here = latLngAtKm(km)
-    markerRef.current = L.circleMarker(here, {
-      radius: 8,
-      color: '#ffffff',
-      weight: 3,
-      fillColor: '#ef4444',
-      fillOpacity: 1,
+    markerRef.current = L.marker(here, {
+      icon: hereArrowIcon(travelBearingDeg(km, pathMode)),
+      interactive: false,
+      keyboard: false,
+      zIndexOffset: 800,
     }).addTo(m)
     m.setView(here, 14)
     mapRef.current = m
+    const onZoom = () => {
+      const pose = poseRef.current
+      prefetchCorridorTiles(m, pose.km, pose.pathMode)
+    }
+    m.on('zoomend', onZoom)
     const ro = new ResizeObserver(() => m.invalidateSize())
     ro.observe(el)
     const t = setTimeout(() => m.invalidateSize(), 150)
     return () => {
       clearTimeout(t)
       ro.disconnect()
+      m.off('zoomend', onZoom)
       m.remove()
       mapRef.current = null
       markerRef.current = null
       windowRef.current = null
+      iriLayerRef.current = null
     }
     // Map is created once; chainage updates move the marker.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2829,59 +3266,139 @@ function CorridorLocationMap({ km, winStart, winEnd }) {
     if (!m || !marker) return
     const here = latLngAtKm(km)
     marker.setLatLng(here)
+    marker.setIcon(hereArrowIcon(travelBearingDeg(km, pathMode)))
     if (windowRef.current) {
-      m.removeLayer(windowRef.current)
+      windowRef.current.forEach((line) => m.removeLayer(line))
       windowRef.current = null
     }
     if (Number.isFinite(winStart) && Number.isFinite(winEnd) && winEnd > winStart) {
-      windowRef.current = L.polyline([latLngAtKm(winStart), latLngAtKm(winEnd)], {
-        color: '#22d3ee',
-        weight: 7,
-        opacity: 0.95,
-      }).addTo(m)
+      const side = pathModeSideSign(pathMode === 'median' ? 'lhs' : pathMode) || SIDE_LHS
+      const sides = pathMode === 'median' ? [SIDE_LHS, SIDE_RHS] : [side]
+      windowRef.current = sides.map((s) => {
+        const ring = carriageOutline(winStart, winEnd, s)
+        if (!ring) return null
+        return L.polygon(ring, {
+          color: '#ffffff',
+          weight: 1.5,
+          opacity: 1,
+          fill: false,
+        }).addTo(m)
+      }).filter(Boolean)
     }
+    prefetchCorridorTiles(m, km, pathMode)
     m.panTo(here, { animate: true, duration: 0.35 })
-  }, [km, winStart, winEnd])
+  }, [km, winStart, winEnd, pathMode])
+
+  useEffect(() => {
+    const m = mapRef.current
+    if (!m) return
+    if (iriLayerRef.current) {
+      m.removeLayer(iriLayerRef.current)
+      iriLayerRef.current = null
+    }
+    const group = L.layerGroup()
+    const runs = iriRunsForMap(iriRecords, pathMode)
+    if (runs.length) {
+      runs.forEach((run) => {
+        L.polyline(lanePoints(run.start, run.end, run.side, laneOffsetM(run.lane)), {
+          color: IRI_MAP_COLORS[run.band] || IRI_MAP_COLORS.na,
+          weight: 4,
+          opacity: 0.95,
+        }).addTo(group)
+      })
+    } else {
+      const line = (medianData.coordinates || []).map(([lng, lat]) => [lat, lng])
+      if (line.length > 1) L.polyline(line, { color: '#f59e0b', weight: 4, opacity: 0.9 }).addTo(group)
+    }
+    group.addTo(m)
+    iriLayerRef.current = group
+    if (windowRef.current) windowRef.current.forEach((line) => line.bringToFront())
+    markerRef.current?.setZIndexOffset?.(800)
+  }, [iriRecords, pathMode])
 
   return (
     <div className="relative h-full min-h-0 w-full overflow-hidden">
       <div ref={wrap} className="absolute inset-0" />
+      <style>{'.nanasa-here-arrow{background:transparent!important;border:none!important;}'}</style>
       <div className="pointer-events-none absolute bottom-2 left-2 z-[500] rounded-lg bg-black/75 px-2 py-1 text-[11px] font-semibold text-white shadow">
         You are here · Ch {Number(km).toFixed(2)} km
       </div>
+      <div className="pointer-events-none absolute right-2 top-2 z-[500] flex items-center gap-2 rounded-lg bg-black/75 px-2 py-1 text-[11px] font-semibold text-white shadow">
+        {[
+          ['good', 'Good'],
+          ['fair', 'Fair'],
+          ['poor', 'Poor'],
+        ].map(([band, label]) => (
+          <span key={band} className="inline-flex items-center gap-1">
+            <i className="inline-block h-2 w-3.5 rounded-sm" style={{ background: IRI_MAP_COLORS[band] }} />
+            {label}
+          </span>
+        ))}
+      </div>
     </div>
   )
+}
+
+function surveyTick(d) {
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+  return `${months[Number(String(d).slice(5, 7)) - 1] || ''} ${String(d).slice(2, 4)}`
 }
 
 function IriTrendChart({ points, activeDate }) {
   if (!points?.length) return null
   const lanes = ['L1', 'L2']
   const colors = { L1: '#facc15', L2: '#38bdf8' }
-  const w = 360
-  const h = 92
-  const pad = { l: 34, r: 8, t: 16, b: 18 }
-  const maxY = Math.max(2800, ...points.flatMap((p) => lanes.map((lane) => (Number.isFinite(p[lane]) ? p[lane] * 1000 : 0))))
+  const w = 1100
+  const h = 230
+  const pad = { l: 86, r: 56, t: 14, b: 40 }
+  const samples = points.flatMap((p) => lanes.map((lane) => (Number.isFinite(p[lane]) ? p[lane] * 1000 : null))).filter((v) => v != null)
+  const dataMax = Math.max(2400, ...samples)
+  const dataMin = Math.min(1800, ...samples)
+  const span = Math.max(600, dataMax - dataMin)
+  const yMax = dataMax + span * 0.18
+  const yMin = Math.max(0, dataMin - span * 0.28)
   const innerW = w - pad.l - pad.r
   const innerH = h - pad.t - pad.b
   const xAt = (i) => pad.l + (points.length === 1 ? innerW / 2 : (i / (points.length - 1)) * innerW)
-  const yAt = (iri) => pad.t + (1 - (iri * 1000) / maxY) * innerH
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-  const label = (d) => `${months[Number(String(d).slice(5, 7)) - 1] || ''} ${String(d).slice(2, 4)}`
-  const guide = (mm) => yAt(mm / 1000)
+  const yAt = (iri) => pad.t + (1 - (iri * 1000 - yMin) / (yMax - yMin)) * innerH
+  const baseline = pad.t + innerH
+  const coords = (lane) => points
+    .map((p, i) => (Number.isFinite(p[lane]) ? [xAt(i), yAt(p[lane])] : null))
+    .filter(Boolean)
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} className="mt-1 block h-[92px] w-full" role="img" aria-label="IRI over survey dates">
-      {[1800, 2400].map((mm) => (
+    <svg viewBox={`0 0 ${w} ${h}`} className="block h-full min-h-0 w-full" role="img" aria-label="IRI over survey dates" preserveAspectRatio="xMidYMid meet">
+      <defs>
+        <linearGradient id="iriFillL1" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#facc15" stopOpacity="0.28" />
+          <stop offset="100%" stopColor="#facc15" stopOpacity="0" />
+        </linearGradient>
+        <linearGradient id="iriFillL2" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.28" />
+          <stop offset="100%" stopColor="#38bdf8" stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      {[1800, 2400].filter((mm) => mm > yMin && mm < yMax).map((mm) => (
         <g key={mm}>
-          <line x1={pad.l} x2={w - pad.r} y1={guide(mm)} y2={guide(mm)} stroke="#334155" strokeDasharray="3 3" />
-          <text x="2" y={guide(mm) + 3} fill="#64748b" fontSize="8">{mm}</text>
+          <line x1={pad.l} x2={w - pad.r} y1={yAt(mm / 1000)} y2={yAt(mm / 1000)} stroke="#1e293b" strokeDasharray="4 4" />
+          <text x={pad.l - 12} y={yAt(mm / 1000) + 6} textAnchor="end" fill="#94a3b8" fontSize="22">{mm}</text>
         </g>
       ))}
+      {points.map((p, i) => (
+        p.date === activeDate ? (
+          <line key={`guide-${p.date}`} x1={xAt(i)} x2={xAt(i)} y1={pad.t} y2={baseline} stroke="#ffffff" strokeOpacity="0.16" />
+        ) : null
+      ))}
       {lanes.map((lane) => {
-        const d = points
-          .map((p, i) => (Number.isFinite(p[lane]) ? `${xAt(i).toFixed(1)},${yAt(p[lane]).toFixed(1)}` : null))
-          .filter(Boolean)
-        if (d.length < 2) return null
-        return <path key={lane} d={`M${d.join('L')}`} fill="none" stroke={colors[lane]} strokeWidth="1.7" />
+        const pts = coords(lane)
+        if (pts.length < 2) return null
+        const line = pts.map((p, i) => `${i ? 'L' : 'M'}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join('')
+        const area = `${line} L${pts[pts.length - 1][0].toFixed(1)},${baseline} L${pts[0][0].toFixed(1)},${baseline} Z`
+        return (
+          <g key={lane}>
+            <path d={area} fill={`url(#iriFill${lane})`} />
+            <path d={line} fill="none" stroke={colors[lane]} strokeWidth="4" strokeLinejoin="round" strokeLinecap="round" />
+          </g>
+        )
       })}
       {points.map((p, i) => lanes.map((lane) => (
         Number.isFinite(p[lane]) ? (
@@ -2889,44 +3406,53 @@ function IriTrendChart({ points, activeDate }) {
             key={`${lane}-${p.date}`}
             cx={xAt(i)}
             cy={yAt(p[lane])}
-            r={p.date === activeDate ? 3.4 : 2.1}
+            r={p.date === activeDate ? 8 : 5.5}
             fill={colors[lane]}
-            stroke={p.date === activeDate ? '#ffffff' : 'none'}
-            strokeWidth="1.2"
+            stroke={p.date === activeDate ? '#ffffff' : '#0b1220'}
+            strokeWidth={p.date === activeDate ? 3 : 2}
           />
         ) : null
       )))}
       {points.map((p, i) => (
-        <text key={p.date} x={xAt(i)} y={h - 4} textAnchor="middle" fill={p.date === activeDate ? '#f8fafc' : '#94a3b8'} fontSize="8">
-          {label(p.date)}
+        <text key={p.date} x={xAt(i)} y={h - 10} textAnchor="middle" fill={p.date === activeDate ? '#f8fafc' : '#cbd5e1'} fontSize="22" fontWeight={p.date === activeDate ? '700' : '600'}>
+          {surveyTick(p.date)}
         </text>
       ))}
     </svg>
   )
 }
 
-function CountTrendChart({ points, color = '#38bdf8' }) {
+function CountTrendChart({ points, activeDate, color = '#38bdf8' }) {
   const rows = points || []
-  if (rows.length < 2 || rows.every((p) => !p.n)) return null
-  const w = 360
-  const h = 46
-  const pad = { l: 8, r: 8, t: 4, b: 14 }
+  if (!rows.length) return null
+  const w = 1100
+  const h = 220
+  const pad = { l: 28, r: 28, t: 36, b: 42 }
   const maxN = Math.max(...rows.map((p) => p.n), 1)
   const innerW = w - pad.l - pad.r
-  const gap = 4
+  const gap = 28
   const barW = (innerW - gap * (rows.length - 1)) / rows.length
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-  const label = (d) => `${months[Number(String(d).slice(5, 7)) - 1] || ''} ${String(d).slice(2, 4)}`
+  const used = rows.length * barW + (rows.length - 1) * gap
+  const origin = pad.l + (innerW - used) / 2
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} className="mt-1 block h-[46px] w-full" role="img" aria-label="Count over survey dates">
+    <svg viewBox={`0 0 ${w} ${h}`} className="block h-full min-h-0 w-full" role="img" aria-label="Predicted distress over survey dates" preserveAspectRatio="xMidYMid meet">
+      <defs>
+        <linearGradient id="predBar" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={color} stopOpacity="1" />
+          <stop offset="100%" stopColor={color} stopOpacity="0.35" />
+        </linearGradient>
+      </defs>
       {rows.map((p, i) => {
-        const bh = Math.max(1, ((h - pad.t - pad.b) * p.n) / maxN)
-        const x = pad.l + i * (barW + gap)
+        const plotH = h - pad.t - pad.b
+        const bh = Math.max(p.n ? 6 : 2, (plotH * p.n) / maxN)
+        const x = origin + i * (barW + gap)
         const y = h - pad.b - bh
+        const on = p.date === activeDate || (!activeDate && i === rows.length - 1)
         return (
           <g key={p.date}>
-            <rect x={x} y={y} width={barW} height={bh} rx="2" fill={color} opacity={p.n ? 0.9 : 0.25} />
-            <text x={x + barW / 2} y={h - 3} textAnchor="middle" fill="#94a3b8" fontSize="8">{label(p.date)}</text>
+            <text x={x + barW / 2} y={y - 10} textAnchor="middle" fill={on ? '#f8fafc' : '#cbd5e1'} fontSize="22" fontWeight="700">{p.n}</text>
+            <rect x={x} y={y} width={barW} height={bh} rx="8" fill={p.n ? 'url(#predBar)' : '#1e293b'} />
+            <text x={x + barW / 2} y={h - 12} textAnchor="middle" fill={on ? '#f8fafc' : '#cbd5e1'} fontSize="22" fontWeight={on ? '700' : '600'}>{surveyTick(p.date)}</text>
           </g>
         )
       })}
@@ -3016,7 +3542,7 @@ export default function NanasaRoad3DModal({
   }, [])
 
   const [pathMode, setPathMode] = useState('lhs') // median | lhs | rhs
-  const [showGraphs, setShowGraphs] = useState(false)
+  const [showDetails, setShowDetails] = useState(false)
   const [scrubT, setScrubT] = useState(0) // 0..1 along selected path
   const [followScrubber, setFollowScrubber] = useState(true)
   const [pavementFilter, setPavementFilter] = useState('all') // all | off | good | fair | poor
@@ -3030,7 +3556,7 @@ export default function NanasaRoad3DModal({
   const [sceneLoading, setSceneLoading] = useState(true)
   const [playing, setPlaying] = useState(false)
   const [chromeMode, setChromeMode] = useState('normal') // normal | fullscreen | minimized
-  const [windowLengthM, setWindowLengthM] = useState(10) // cards + highlight patch length
+  const [windowLengthM, setWindowLengthM] = useState(100) // cards + highlight patch length
   const shellRef = useRef(null)
 
   const playingRef = useRef(false)
@@ -3071,18 +3597,14 @@ export default function NanasaRoad3DModal({
   // Jump to map drop / entry point when opened or re-dropped
   useEffect(() => {
     if (!open) return
-    const mode = initialPathMode === 'lhs' || initialPathMode === 'rhs' || initialPathMode === 'median'
+    const mode = initialPathMode === 'lhs' || initialPathMode === 'rhs' || initialPathMode === 'median' || initialPathMode === 'sinc' || initialPathMode === 'sdec'
       ? initialPathMode
       : null
     if (mode) setPathMode(mode)
     if (Number.isFinite(Number(initialChainageKm))) {
-      const span = CHAINAGE_MAX_KM - CHAINAGE_MIN_KM || 1
       const km = Math.max(CHAINAGE_MIN_KM, Math.min(CHAINAGE_MAX_KM, Number(initialChainageKm)))
       const m = mode || pathModeRef.current || 'lhs'
-      const t = m === 'rhs'
-        ? (CHAINAGE_MAX_KM - km) / span
-        : (km - CHAINAGE_MIN_KM) / span
-      setScrubT(Math.max(0, Math.min(1, t)))
+      setScrubT(scrubTFromChainageKm(m, km))
       setFollowScrubber(true)
       setPlaying(false)
     }
@@ -3173,14 +3695,7 @@ export default function NanasaRoad3DModal({
     applyDistressFilter(runtime.current?.predictedLayer, predictedFilter)
   }, [predictedFilter])
 
-  const scrubToChainage = useCallback((mode, t) => {
-    const clamped = Math.max(0, Math.min(1, t))
-    if (mode === 'rhs') {
-      // RHS travels end → start as scrubber moves 0 → 1
-      return CHAINAGE_MAX_KM - clamped * (CHAINAGE_MAX_KM - CHAINAGE_MIN_KM)
-    }
-    return CHAINAGE_MIN_KM + clamped * (CHAINAGE_MAX_KM - CHAINAGE_MIN_KM)
-  }, [])
+  const scrubToChainage = useCallback((mode, t) => chainageKmFromScrubT(mode, t), [])
 
   const chainageSlice = useMemo(() => {
     const km = scrubToChainage(pathMode, scrubT)
@@ -3190,6 +3705,7 @@ export default function NanasaRoad3DModal({
 
     // PMS rows: prefer `direction`, else resolve carriageway from survey GPS
     const pavement = pmsRecords.filter((r) => {
+      if (!matchesPathRoad(r, pathMode)) return false
       if (!overlapsKm(r.start, r.end, winStart, winEnd)) return false
       if (!want) return true
       if (r.direction && matchesPathDir(r.direction, pathMode)) return true
@@ -3201,6 +3717,7 @@ export default function NanasaRoad3DModal({
     })
 
     const matchesDistress = (r) => {
+      if (!matchesPathRoad(r, pathMode)) return false
       if (!want) return true
       const d = String(r.direction || '').toLowerCase()
       if (d.startsWith('inc')) return want === SIDE_LHS
@@ -3220,10 +3737,15 @@ export default function NanasaRoad3DModal({
     )
     const invPts = invPoints.filter(
       (r) =>
-        overlapsKm(r.start, r.end ?? r.start, winStart, winEnd) && matchesPathDir(r.dir, pathMode),
+        overlapsKm(r.start, r.end ?? r.start, winStart, winEnd) &&
+        matchesPathDir(r.dir, pathMode) &&
+        matchesPathRoad(r, pathMode),
     )
     const invLn = invLines.filter(
-      (r) => overlapsKm(r.start, r.end ?? r.start, winStart, winEnd) && matchesPathDir(r.dir, pathMode),
+      (r) =>
+        overlapsKm(r.start, r.end ?? r.start, winStart, winEnd) &&
+        matchesPathDir(r.dir, pathMode) &&
+        matchesPathRoad(r, pathMode),
     )
     const invLabel = (r, fallback) =>
       `${r.asset || r.name || fallback}${r.road === 'service' ? ' · Service Rd' : ''}`
@@ -3232,10 +3754,10 @@ export default function NanasaRoad3DModal({
     const barrierLines = invLines.filter(
       (r) =>
         /barrier/i.test(r.asset || r.name || '') &&
-        r.road !== 'service' &&
+        matchesPathRoad(r, pathMode) &&
         matchesPathDir(r.dir, pathMode),
     )
-    if (barrierLines.length && !lineNames.some((n) => /barrier/i.test(n) && !/service/i.test(n))) {
+    if (barrierLines.length && !lineNames.some((n) => /barrier/i.test(n) && (isServicePath(pathMode) ? /service/i.test(n) : !/service/i.test(n)))) {
       const barrierName = barrierLines[0].asset || barrierLines[0].name || 'Crash Barrier'
       const drawn = mergeBarrierRuns(barrierLines).some((run) =>
         overlapsKm(run.start, run.end ?? run.start, winStart, winEnd),
@@ -3279,9 +3801,18 @@ export default function NanasaRoad3DModal({
     invLines,
   ])
 
+  useEffect(() => {
+    if (!open || sceneLoading) return
+    const rt = runtime.current
+    if (!rt) return
+    rt.iriPaint = { records: pmsRecords, filter: pavementFilter, mode: pathMode }
+    rt.iriSlideKm = null
+  }, [open, sceneLoading, pavementFilter, pmsRecords, pathMode])
+
   const iriTrend = useMemo(() => {
     const dates = [...(pmsData.dates || [])].sort()
     const rows = (pmsData.records || []).filter((r) => {
+      if (isServicePath(pathMode)) return false
       if (r.project !== NANASA_PROJECT) return false
       if (!overlapsKm(r.start, r.end, chainageSlice.winStart, chainageSlice.winEnd)) return false
       return matchesPathDir(r.direction, pathMode)
@@ -3299,7 +3830,7 @@ export default function NanasaRoad3DModal({
   }, [chainageSlice.winStart, chainageSlice.winEnd, pathMode])
 
   const predictedIndex = useMemo(() => {
-    if (!showGraphs) return null
+    if (!open) return null
     const index = new Map()
     ;(predictedData.records || []).forEach((r) => {
       if (r.project_name !== NANASA_PROJECT || !r.date) return
@@ -3310,14 +3841,15 @@ export default function NanasaRoad3DModal({
       index.set(key, (index.get(key) || 0) + 1)
     })
     return index
-  }, [showGraphs])
+  }, [open])
 
   const predictedTrend = useMemo(() => {
     if (!predictedIndex) return []
     const dates = [...(predictedData.projects_dates?.[NANASA_PROJECT] || [])].sort()
     const startBin = Math.floor(chainageSlice.winStart * 10)
     const endBin = Math.floor((chainageSlice.winEnd - 1e-6) * 10)
-    const dirs = pathMode === 'rhs' ? ['d'] : pathMode === 'lhs' ? ['i'] : ['i', 'd']
+    const dirs = pathMode === 'rhs' || pathMode === 'sdec' ? ['d'] : pathMode === 'lhs' || pathMode === 'sinc' ? ['i'] : ['i', 'd']
+    if (isServicePath(pathMode)) return []
     return dates.map((date) => {
       let n = 0
       for (let bin = startBin; bin <= endBin; bin += 1) {
@@ -3339,24 +3871,26 @@ export default function NanasaRoad3DModal({
     sr.follow = follow
     if (!rt?.points?.length) return
 
+    const service = isServicePath(mode)
     const sample = sampleChainageShoulder(
       rt.points,
       chainageKm,
       CHAINAGE_MIN_KM,
       CHAINAGE_MAX_KM,
       mode,
-      mode === 'median' ? 0 : SCRUBBER_SHOULDER_M,
+      mode === 'median' ? 0 : service ? SERVICE_ROAD_CENTRE_M : SCRUBBER_SHOULDER_M,
     )
-    // Camera rides the centre of the active carriageway (not median, not outer shoulder)
+    // Camera rides the centre of the active carriageway or service road
     const camSample = sampleChainageShoulder(
       rt.points,
       chainageKm,
       CHAINAGE_MIN_KM,
       CHAINAGE_MAX_KM,
       mode,
-      mode === 'median' ? 0 : DISTRESS_LANE_M,
+      mode === 'median' ? 0 : service ? SERVICE_ROAD_CENTRE_M : DISTRESS_LANE_M,
     )
 
+    const markerKey = mode === 'sinc' ? 'lhs' : mode === 'sdec' ? 'rhs' : mode
     const markers = {
       lhs: rt.lhsMarker,
       rhs: rt.rhsMarker,
@@ -3364,9 +3898,9 @@ export default function NanasaRoad3DModal({
     }
     Object.entries(markers).forEach(([key, mk]) => {
       if (!mk) return
-      mk.visible = key === mode
+      mk.visible = key === markerKey
     })
-    const active = markers[mode] || rt.medMarker
+    const active = markers[markerKey] || rt.medMarker
     if (active) {
       active.position.set(sample.x, 0, sample.z)
       active.rotation.y = sample.yaw
@@ -3464,6 +3998,11 @@ export default function NanasaRoad3DModal({
     renderer.toneMapping = THREE.ACESFilmicToneMapping
     renderer.toneMappingExposure = 1.12
     renderer.outputColorSpace = THREE.SRGBColorSpace
+    renderer.domElement.style.position = 'absolute'
+    renderer.domElement.style.inset = '0'
+    renderer.domElement.style.width = '100%'
+    renderer.domElement.style.height = '100%'
+    renderer.domElement.style.display = 'block'
     el.appendChild(renderer.domElement)
 
     const controls = new OrbitControls(camera, renderer.domElement)
@@ -3509,18 +4048,15 @@ export default function NanasaRoad3DModal({
     const pavementLayer = addPavementIri(root, points, origin, pmsRecords)
     applyPavementFilter(pavementLayer, pavementFilter, concreteLayer)
 
-    const lhsMarker = makeScrubberMarker(0x22c55e, new THREE.MeshStandardMaterial({ color: 0x166534 }))
-    const rhsMarker = makeScrubberMarker(0x3b82f6, new THREE.MeshStandardMaterial({ color: 0x1d4ed8 }))
-    const medMarker = makeScrubberMarker(0xf59e0b, new THREE.MeshStandardMaterial({ color: 0xb45309 }))
     const chainageHighlight = new THREE.Group()
     chainageHighlight.name = 'chainage10mHighlight'
-    root.add(lhsMarker, rhsMarker, medMarker, chainageHighlight)
+    root.add(chainageHighlight)
 
     runtime.current = {
       points,
-      lhsMarker,
-      rhsMarker,
-      medMarker,
+      lhsMarker: null,
+      rhsMarker: null,
+      medMarker: null,
       chainageHighlight,
       concreteLayer,
       pavementLayer,
@@ -3567,6 +4103,17 @@ export default function NanasaRoad3DModal({
         const alpha = 1 - Math.exp(-dt * 3.2)
         camera.position.lerp(sr.camPos, alpha)
         controls.target.lerp(sr.lookAt, alpha)
+      }
+      const rtIri = runtime.current
+      if (rtIri?.iriPaint && Number.isFinite(sr.chainageKm)) {
+        const targetKm = sr.chainageKm
+        if (rtIri.iriSlideKm == null || Math.abs(targetKm - rtIri.iriSlideKm) > 0.45) rtIri.iriSlideKm = targetKm
+        else rtIri.iriSlideKm += (targetKm - rtIri.iriSlideKm) * (1 - Math.exp(-dt * 7))
+        syncIriRoadLabel(
+          rtIri,
+          rtIri.iriSlideKm,
+          Number.isFinite(sr._hlStart) && Number.isFinite(sr._hlEnd) ? (sr._hlStart + sr._hlEnd) / 2 : sr.chainageKm,
+        )
       }
       controls.update()
       renderer.render(scene, camera)
@@ -3692,12 +4239,40 @@ export default function NanasaRoad3DModal({
 
   const fmtCh = (n) => (Math.abs(n - Math.round(n)) < 0.05 ? `${Math.round(n)}` : n.toFixed(2))
   const currentKm = scrubToChainage(pathMode, scrubT)
+  const roadType = (() => {
+    const rows = chainageSlice.pavement || []
+    const here = rows.filter((r) => currentKm >= Number(r.start) && currentKm < Number(r.end))
+    const pool = here.length ? here : rows
+    return pool.some((r) => String(r.pavement || '').toLowerCase() === 'concrete') ? 'Concrete' : 'Bituminous'
+  })()
+  const ahead = upcomingDistress(reportedRecords, currentKm, pathMode, reportedFilter)
+  const aheadRecord = ahead?.record
   const pathLabel =
-    pathMode === 'lhs' ? 'LHS · Increasing' : pathMode === 'rhs' ? 'RHS · Decreasing' : 'Median'
+    pathMode === 'lhs'
+      ? 'Increasing'
+      : pathMode === 'rhs'
+        ? 'Decreasing'
+        : pathMode === 'sinc'
+          ? 'Service road (S Increasing)'
+          : pathMode === 'sdec'
+            ? 'Service road (S Decreasing)'
+            : 'Median'
+  const pathAccentClass =
+    pathMode === 'lhs' || pathMode === 'sinc'
+      ? 'accent-emerald-500'
+      : pathMode === 'rhs' || pathMode === 'sdec'
+        ? 'accent-blue-500'
+        : 'accent-amber-500'
   const onPathChange = (mode) => {
     setPlaying(false)
+    const km = scrubToChainage(pathMode, scrubT)
     setPathMode(mode)
-    setScrubT(0)
+    if (isServicePath(mode) || isServicePath(pathMode)) {
+      if (isServicePath(mode)) setFollowScrubber(true)
+      setScrubT(scrubTFromChainageKm(mode, km))
+    } else {
+      setScrubT(0)
+    }
   }
 
   const togglePlay = () => {
@@ -3717,11 +4292,9 @@ export default function NanasaRoad3DModal({
     const e = Number(rec.chainage_end)
     const mid = Number.isFinite(e) && e > s ? (s + e) / 2 : s
     const km = Math.max(CHAINAGE_MIN_KM, Math.min(CHAINAGE_MAX_KM, mid))
-    const span = CHAINAGE_MAX_KM - CHAINAGE_MIN_KM || 1
-    const t = pathMode === 'rhs' ? (CHAINAGE_MAX_KM - km) / span : (km - CHAINAGE_MIN_KM) / span
     setPlaying(false)
     setFollowScrubber(true)
-    setScrubT(Math.max(0, Math.min(1, t)))
+    setScrubT(scrubTFromChainageKm(pathMode, km))
     setFocusedDistress(rec)
     if (kind === 'reported') {
       if (reportedFilter === 'off') setReportedFilter('all')
@@ -3734,7 +4307,7 @@ export default function NanasaRoad3DModal({
   /** Step along path by the selected window length. */
   const stepScrub = (dir) => {
     setPlaying(false)
-    const span = CHAINAGE_MAX_KM - CHAINAGE_MIN_KM || 1
+    const span = (isServicePath(pathMode) ? servicePathLengthKm(pathMode) : CHAINAGE_MAX_KM - CHAINAGE_MIN_KM) || 1
     const delta = (windowLengthM / 1000 / span) * dir
     setScrubT((t) => Math.max(0, Math.min(1, t + delta)))
   }
@@ -3743,6 +4316,7 @@ export default function NanasaRoad3DModal({
     pmsDates.length > 0 && {
       id: 'pavementDate',
       title: 'Pavement survey date',
+      compact: 'Date',
       value: pavementDate,
       setValue: setPavementDate,
       labels: Object.fromEntries(pmsDates.map((d) => [d, formatSurveyDate(d)])),
@@ -3755,9 +4329,10 @@ export default function NanasaRoad3DModal({
     pmsRecords.length > 0 && {
       id: 'pavement',
       title: 'Pavement layer',
+      compact: 'IRI',
       value: pavementFilter,
       setValue: setPavementFilter,
-      labels: { off: 'Off', all: 'All (On)', good: 'Good only', fair: 'Fair only', poor: 'Poor only' },
+      labels: { off: 'Off', all: 'All', good: 'Good', fair: 'Fair', poor: 'Poor' },
       options: [
         { id: 'off', label: 'Off', swatches: [] },
         { id: 'all', label: 'All (On)', swatches: ['#111111', '#FACC15', '#F8FAFC'] },
@@ -3769,28 +4344,24 @@ export default function NanasaRoad3DModal({
     reportedRecords.length > 0 && {
       id: 'reported',
       title: 'Reported distress',
+      compact: 'Reported',
       value: reportedFilter,
       setValue: setReportedFilter,
-      labels: { all: 'All (On)', low: 'Low', medium: 'Medium', high: 'High', off: 'Off' },
+      labels: { all: 'All', off: 'Off' },
       options: [
-        { id: 'all', label: 'All patches', swatches: ['#22c55e', '#FACC15', '#ef4444'] },
-        { id: 'low', label: 'Low (patch)', swatches: ['#22c55e'] },
-        { id: 'medium', label: 'Medium (patch)', swatches: ['#FACC15'] },
-        { id: 'high', label: 'High (patch)', swatches: ['#ef4444'] },
+        { id: 'all', label: 'All patches', swatches: ['#f59e0b'] },
         { id: 'off', label: 'Off', swatches: [] },
       ],
     },
     predictedRecords.length > 0 && {
       id: 'predicted',
       title: 'Predicted distress',
+      compact: 'Predicted',
       value: predictedFilter,
       setValue: setPredictedFilter,
-      labels: { all: 'All (On)', low: 'Low', medium: 'Medium', high: 'High', off: 'Off' },
+      labels: { all: 'All', off: 'Off' },
       options: [
-        { id: 'all', label: 'All pins', swatches: ['#38bdf8', '#a78bfa', '#f472b6'] },
-        { id: 'low', label: 'Low (pin)', swatches: ['#38bdf8'] },
-        { id: 'medium', label: 'Medium (pin)', swatches: ['#a78bfa'] },
-        { id: 'high', label: 'High (pin)', swatches: ['#f472b6'] },
+        { id: 'all', label: 'All pins', swatches: ['#38bdf8'] },
         { id: 'off', label: 'Off', swatches: [] },
       ],
     },
@@ -3802,12 +4373,81 @@ export default function NanasaRoad3DModal({
     ? 'pointer-events-auto fixed inset-0 z-[2000] flex h-screen w-screen flex-col overflow-hidden rounded-none border-0 bg-[#0b1220] shadow-none'
     : isMinimized
       ? 'pointer-events-auto fixed bottom-3 right-3 z-[2000] flex h-[200px] w-[min(360px,calc(100vw-1.5rem))] flex-col overflow-hidden rounded-2xl border border-white/40 bg-[#0b1220] shadow-[0_20px_60px_rgba(15,23,42,0.55)]'
-      : 'pointer-events-auto absolute inset-1 z-[1200] flex flex-col overflow-hidden rounded-2xl border border-white/70 bg-[#0b1220]/40 shadow-[0_30px_80px_rgba(15,23,42,0.45)]'
+      : 'pointer-events-auto absolute inset-0 z-[1200] flex h-full w-full flex-col overflow-hidden bg-[#0b1220] shadow-[0_30px_80px_rgba(15,23,42,0.45)]'
+
+  const windowButtons = (
+    <div className="pointer-events-auto absolute right-2 top-2 z-[500] flex items-center gap-1">
+      {!isMinimized && (
+        <button
+          type="button"
+          onClick={async () => {
+            try {
+              if (document.fullscreenElement || document.webkitFullscreenElement) {
+                if (document.exitFullscreen) await document.exitFullscreen()
+                else if (document.webkitExitFullscreen) await document.webkitExitFullscreen()
+              }
+            } catch {
+              /* ignore */
+            }
+            setChromeMode('minimized')
+          }}
+          title="Minimize"
+          aria-label="Minimize"
+          className="rounded-full border border-white/20 bg-black/55 px-2.5 py-1.5 text-[12px] font-semibold text-white backdrop-blur hover:bg-black/70"
+        >
+          −
+        </button>
+      )}
+      {isMinimized && (
+        <button
+          type="button"
+          onClick={() => setChromeMode('normal')}
+          title="Restore"
+          aria-label="Restore"
+          className="rounded-full border border-white/20 bg-black/55 px-2.5 py-1.5 text-[11px] font-semibold text-white backdrop-blur hover:bg-black/70"
+        >
+          Restore
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={toggleFullscreen}
+        title={isFullscreen ? 'Exit full screen' : 'Full screen'}
+        aria-label={isFullscreen ? 'Exit full screen' : 'Full screen'}
+        className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-white/20 bg-black/55 text-white backdrop-blur hover:bg-black/70"
+      >
+        {isFullscreen ? (
+          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
+            <path d="M9 3v6H3 M15 3v6h6 M9 21v-6H3 M15 21v-6h6" />
+          </svg>
+        ) : (
+          <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
+            <path d="M3 9V3h6 M15 3h6v6 M21 15v6h-6 M9 21H3v-6" />
+          </svg>
+        )}
+      </button>
+      <button
+        type="button"
+        onClick={() => {
+          if (document.fullscreenElement || document.webkitFullscreenElement) {
+            exitBrowserFullscreen().finally(() => onClose())
+          } else {
+            onClose()
+          }
+        }}
+        title="Close"
+        aria-label="Close"
+        className="rounded-full border border-white/20 bg-black/55 px-2.5 py-1.5 text-[12px] font-semibold text-white backdrop-blur hover:bg-black/70"
+      >
+        Close
+      </button>
+    </div>
+  )
 
   return (
     <div ref={shellRef} className={shellClass}>
       <div className="flex min-h-0 flex-1">
-        <div className={`relative min-h-0 ${isMinimized ? 'w-full' : 'w-1/2'}`}>
+        <div className={`relative min-h-0 overflow-hidden bg-[#b9cfe3] ${isMinimized ? 'w-full' : 'w-[53%]'}`}>
         <div ref={host} className="absolute inset-0" />
         <div
           className={`pointer-events-none absolute inset-0 z-40 flex flex-col items-center justify-center gap-4 bg-gradient-to-b from-[#a8c6de] via-[#8fb3cf] to-[#4d7a4a] transition-opacity duration-500 ${sceneLoading ? 'opacity-100' : 'opacity-0'}`}
@@ -3828,80 +4468,57 @@ export default function NanasaRoad3DModal({
           </div>
           <style>{'@keyframes road3dLoad{0%{transform:translateX(-100%)}100%{transform:translateX(300%)}}'}</style>
         </div>
-        <div className="pointer-events-auto absolute right-2 top-2 z-30 flex items-center gap-1">
-          {!isMinimized && (
-            <button
-              type="button"
-              onClick={async () => {
-                try {
-                  if (document.fullscreenElement || document.webkitFullscreenElement) {
-                    if (document.exitFullscreen) await document.exitFullscreen()
-                    else if (document.webkitExitFullscreen) await document.webkitExitFullscreen()
-                  }
-                } catch {
-                  /* ignore */
-                }
-                setChromeMode('minimized')
-              }}
-              title="Minimize"
-              aria-label="Minimize"
-              className="rounded-full border border-white/20 bg-black/55 px-2.5 py-1.5 text-[12px] font-semibold text-white backdrop-blur hover:bg-black/70"
-            >
-              −
-            </button>
-          )}
-          {isMinimized && (
-            <button
-              type="button"
-              onClick={() => setChromeMode('normal')}
-              title="Restore"
-              aria-label="Restore"
-              className="rounded-full border border-white/20 bg-black/55 px-2.5 py-1.5 text-[11px] font-semibold text-white backdrop-blur hover:bg-black/70"
-            >
-              Restore
-            </button>
-          )}
-          <button
-            type="button"
-            onClick={toggleFullscreen}
-            title={isFullscreen ? 'Exit full screen' : 'Full screen'}
-            aria-label={isFullscreen ? 'Exit full screen' : 'Full screen'}
-            className="inline-flex h-8 w-8 items-center justify-center rounded-full border border-white/20 bg-black/55 text-white backdrop-blur hover:bg-black/70"
-          >
-            {isFullscreen ? (
-              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
-                <path d="M9 3v6H3 M15 3v6h6 M9 21v-6H3 M15 21v-6h6" />
-              </svg>
-            ) : (
-              <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
-                <path d="M3 9V3h6 M15 3h6v6 M21 15v6h-6 M9 21H3v-6" />
-              </svg>
-            )}
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              if (document.fullscreenElement || document.webkitFullscreenElement) {
-                exitBrowserFullscreen().finally(() => onClose())
-              } else {
-                onClose()
-              }
-            }}
-            title="Close"
-            aria-label="Close"
-            className="rounded-full border border-white/20 bg-black/55 px-2.5 py-1.5 text-[12px] font-semibold text-white backdrop-blur hover:bg-black/70"
-          >
-            Close
-          </button>
-        </div>
+        {isMinimized && windowButtons}
+        {!isMinimized && (
+          <div className="pointer-events-none absolute left-4 top-4 z-20 [text-shadow:0_2px_4px_rgba(0,0,0,0.95),0_0_10px_rgba(0,0,0,0.8)]">
+            <p className="m-0 text-[12px] font-bold uppercase tracking-[0.16em] text-slate-100">Road type</p>
+            <p className="m-0 text-[22px] font-extrabold leading-tight text-white">{roadType}</p>
+          </div>
+        )}
         {isMinimized ? (
           <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-black/70 to-transparent px-3 pb-2 pt-8">
             <p className="m-0 text-[11px] font-semibold text-white">Nanasa 3D · Ch {chainageSlice.winStart.toFixed(2)} km</p>
           </div>
         ) : (
         <>
+        <div className="pointer-events-none absolute left-12 top-40 z-20 flex max-w-[340px] items-center gap-3 bg-transparent [text-shadow:0_2px_4px_rgba(0,0,0,0.95),0_0_10px_rgba(0,0,0,0.8)]">
+          <div className="min-w-0">
+            <p className="m-0 text-[13px] font-bold uppercase tracking-[0.16em] text-amber-300">Next distress</p>
+            {reportedFilter === 'off' ? (
+              <p className="m-0 text-[28px] font-bold leading-none text-white">Layer off</p>
+            ) : ahead?.none || !aheadRecord ? (
+              <p className="m-0 text-[28px] font-bold leading-none text-white">None ahead</p>
+            ) : (
+              <>
+                <p className="m-0 text-[36px] font-extrabold tabular-nums leading-none text-white">
+                  {formatAheadDistance(ahead.meters)}
+                </p>
+                <p className="m-0 mt-1 truncate text-[16px] font-semibold text-white">
+                  {aheadRecord.distress_type || 'Distress'}
+                  {Number.isFinite(Number(aheadRecord.chainage_start))
+                    ? ` · Ch ${Number(aheadRecord.chainage_start).toFixed(2)}`
+                    : ''}
+                </p>
+              </>
+            )}
+          </div>
+          {reportedFilter !== 'off' && aheadRecord && (
+            <button
+              type="button"
+              onClick={() => locateDistress(aheadRecord, 'reported')}
+              title="Go to this distress"
+              aria-label="Go to this distress"
+              className="pointer-events-auto grid h-11 w-11 shrink-0 place-items-center rounded-full border border-white/50 bg-white/15 text-white shadow hover:bg-white/30"
+            >
+              <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2.4" aria-hidden>
+                <circle cx="12" cy="12" r="3" />
+                <path d="M12 2v3M12 19v3M2 12h3M19 12h3" strokeLinecap="round" />
+              </svg>
+            </button>
+          )}
+        </div>
         <div className="pointer-events-none absolute left-1/2 top-10 z-20 -translate-x-1/2">
-          <div className="pointer-events-auto flex items-center gap-2 rounded-full bg-transparent px-2 py-1.5 [text-shadow:0_1px_2px_rgba(0,0,0,0.95),0_0_6px_rgba(0,0,0,0.75)] sm:gap-2.5 sm:px-3 sm:py-2">
+          <div className="pointer-events-auto flex flex-nowrap items-center gap-2 rounded-full bg-transparent px-2 py-1.5 [text-shadow:0_1px_2px_rgba(0,0,0,0.95),0_0_6px_rgba(0,0,0,0.75)] sm:gap-2.5 sm:px-3 sm:py-2">
             <button
               type="button"
               onClick={() => stepScrub(-1)}
@@ -3911,9 +4528,9 @@ export default function NanasaRoad3DModal({
             >
               <span aria-hidden className="text-[22px] leading-none">◀</span>
             </button>
-            <div className="min-w-0 px-1 text-center sm:px-2">
-              <p className="m-0 text-[12px] font-semibold uppercase tracking-[0.14em] text-slate-100 sm:text-[13px]">Chainage</p>
-              <p className="m-0 text-[18px] font-semibold tabular-nums leading-tight text-white sm:text-[24px]">
+            <div className="shrink-0 px-1 text-center sm:px-2">
+              <p className="m-0 whitespace-nowrap text-[12px] font-semibold uppercase tracking-[0.14em] text-slate-100 sm:text-[13px]">Chainage</p>
+              <p className="m-0 whitespace-nowrap text-[18px] font-semibold tabular-nums leading-tight text-white sm:text-[22px]">
                 Ch {formatWindowKm(chainageSlice.winStart, windowLengthM)} – {formatWindowKm(chainageSlice.winEnd, windowLengthM)} km
               </p>
             </div>
@@ -3945,7 +4562,8 @@ export default function NanasaRoad3DModal({
           </div>
         </div>
         {layerMenus.length > 0 && (
-          <div className="pointer-events-auto absolute right-3 top-12 z-20 flex w-[min(210px,calc(100%-1.5rem))] flex-col gap-1.5">
+          <div className="pointer-events-none absolute inset-x-0 bottom-9 z-20 flex justify-center px-2">
+            <div className="pointer-events-auto flex max-w-full flex-wrap items-center justify-center gap-0.5 rounded-full border border-white/15 bg-black/90 px-1 py-0.5 shadow-lg">
             {layerMenus.map((menu) => {
               const isOpen = openLayerMenu === menu.id
               return (
@@ -3953,19 +4571,18 @@ export default function NanasaRoad3DModal({
                   <button
                     type="button"
                     onClick={() => setOpenLayerMenu(isOpen ? null : menu.id)}
-                    className="flex w-full items-center justify-between gap-2 rounded-xl border border-white/15 bg-black/60 px-2.5 py-2 text-left shadow-lg backdrop-blur hover:bg-black/70"
+                    className="inline-flex h-7 items-center gap-1 rounded-full px-2 text-left hover:bg-white/10"
                     aria-expanded={isOpen}
+                    title={menu.title}
                   >
-                    <span>
-                      <span className="block text-[10px] font-semibold uppercase tracking-wide text-slate-400">{menu.title}</span>
-                      <span className="text-[12px] font-semibold text-white">{menu.labels[menu.value] || menu.value}</span>
-                    </span>
-                    <span className={`text-[10px] text-slate-300 transition ${isOpen ? 'rotate-180' : ''}`} aria-hidden>
+                    <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">{menu.compact}</span>
+                    <span className="text-[11px] font-semibold text-white">{menu.labels[menu.value] || menu.value}</span>
+                    <span className={`text-[8px] text-slate-300 transition ${isOpen ? 'rotate-180' : ''}`} aria-hidden>
                       ▼
                     </span>
                   </button>
                   {isOpen && (
-                    <div className="absolute left-0 right-0 top-full z-30 mt-1 overflow-hidden rounded-xl border border-white/15 bg-black/90 py-1 shadow-xl backdrop-blur">
+                    <div className="absolute bottom-full left-1/2 z-30 mb-1.5 w-max min-w-[148px] -translate-x-1/2 overflow-hidden rounded-xl border border-white/15 bg-black/90 py-1 shadow-xl backdrop-blur">
                       {menu.options.map((opt) => {
                         const active = menu.value === opt.id
                         return (
@@ -4011,34 +4628,41 @@ export default function NanasaRoad3DModal({
                 </div>
               )
             })}
+            </div>
           </div>
         )}
-        <div className="pointer-events-none absolute inset-0 z-10 flex flex-col justify-end gap-1.5 p-2">
-          <div className="pointer-events-auto flex w-full items-center gap-2 rounded-xl border border-white/15 bg-[#0f172a]/90 px-2.5 py-1.5 shadow-xl backdrop-blur sm:gap-3 sm:px-3 sm:py-2">
+        <div className="pointer-events-none absolute inset-0 z-10 flex flex-col justify-end p-1.5">
+          <div className="pointer-events-auto flex h-7 w-full items-center gap-1.5 rounded-full border border-white/15 bg-[#0f172a] px-1.5 shadow-lg">
             <select
               value={pathMode}
               onChange={(e) => onPathChange(e.target.value)}
-              className="h-8 shrink-0 rounded-lg border border-white/15 bg-white/10 px-2 text-[12px] font-semibold text-white outline-none [&>option]:bg-slate-900 [&>option]:text-white"
-              title="Path"
+              className="h-5 shrink-0 rounded-full border border-white/15 bg-white/10 px-2 text-[10px] font-semibold text-white outline-none [&>option]:bg-slate-900 [&>option]:text-white"
+              title="Path: Increasing, Decreasing, or service road"
             >
               <option value="median" style={{ background: '#0f172a', color: '#fff' }}>Median</option>
-              <option value="lhs" style={{ background: '#0f172a', color: '#fff' }}>LHS</option>
-              <option value="rhs" style={{ background: '#0f172a', color: '#fff' }}>RHS</option>
+              <optgroup label="Main carriageway">
+                <option value="lhs" style={{ background: '#0f172a', color: '#fff' }}>Increasing</option>
+                <option value="rhs" style={{ background: '#0f172a', color: '#fff' }}>Decreasing</option>
+              </optgroup>
+              <optgroup label="Service road">
+                <option value="sinc" style={{ background: '#0f172a', color: '#fff' }}>Service road (S Increasing)</option>
+                <option value="sdec" style={{ background: '#0f172a', color: '#fff' }}>Service road (S Decreasing)</option>
+              </optgroup>
             </select>
-            <div className="inline-flex shrink-0 items-center gap-1">
+            <div className="inline-flex shrink-0 items-center gap-0.5">
               <button
                 type="button"
                 onClick={() => stepScrub(-1)}
-                className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-white/15 bg-white/10 text-white hover:bg-white/20"
+                className="inline-flex h-5 w-5 items-center justify-center rounded-full text-white hover:bg-white/15"
                 title={`Back ${windowLengthM >= 1000 ? '1 km' : `${windowLengthM} m`}`}
                 aria-label="Move backward"
               >
-                <span aria-hidden className="text-[13px] leading-none">◀</span>
+                <span aria-hidden className="text-[10px] leading-none">◀</span>
               </button>
               <button
                 type="button"
                 onClick={togglePlay}
-                className={`inline-flex h-8 shrink-0 items-center gap-1 rounded-lg px-2.5 text-[12px] font-semibold ${playing ? 'bg-amber-500 text-white' : 'bg-emerald-600 text-white hover:bg-emerald-500'}`}
+                className={`inline-flex h-5 shrink-0 items-center gap-0.5 rounded-full px-1.5 text-[10px] font-semibold ${playing ? 'bg-amber-500 text-white' : 'bg-emerald-600 text-white hover:bg-emerald-500'}`}
                 title={playing ? 'Pause' : 'Play'}
               >
                 {playing ? (
@@ -4054,42 +4678,32 @@ export default function NanasaRoad3DModal({
               <button
                 type="button"
                 onClick={() => stepScrub(1)}
-                className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-white/15 bg-white/10 text-white hover:bg-white/20"
+                className="inline-flex h-5 w-5 items-center justify-center rounded-full text-white hover:bg-white/15"
                 title={`Forward ${windowLengthM >= 1000 ? '1 km' : `${windowLengthM} m`}`}
                 aria-label="Move forward"
               >
-                <span aria-hidden className="text-[13px] leading-none">▶</span>
+                <span aria-hidden className="text-[10px] leading-none">▶</span>
               </button>
             </div>
-            <div className="min-w-0 flex-1">
-              <div className="mb-0.5 grid grid-cols-3 items-center gap-2 text-[11px]">
-                <span className={`font-medium ${pathMode === 'lhs' ? 'text-emerald-400' : pathMode === 'rhs' ? 'text-blue-400' : 'text-amber-400'}`}>
-                  {pathLabel}
-                </span>
-                <span className="text-center tabular-nums font-semibold text-white">
-                  Ch {fmtCh(currentKm)} km
-                </span>
-                <span />
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.0005}
-                value={scrubT}
-                onChange={(e) => {
-                  setPlaying(false)
-                  setScrubT(Number(e.target.value))
-                }}
-                className={`h-1.5 w-full cursor-pointer ${pathMode === 'lhs' ? 'accent-emerald-500' : pathMode === 'rhs' ? 'accent-blue-500' : 'accent-amber-500'}`}
-              />
-              <div className="mt-0.5 flex justify-between text-[9px] text-slate-500">
-                <span>{pathMode === 'rhs' ? CHAINAGE_MAX_KM : CHAINAGE_MIN_KM} km</span>
-                <span>{pathMode === 'rhs' ? CHAINAGE_MIN_KM : CHAINAGE_MAX_KM} km</span>
-              </div>
-            </div>
-            <label className="inline-flex shrink-0 cursor-pointer items-center gap-1.5 text-[11px] text-slate-300">
-              <input type="checkbox" checked={followScrubber} onChange={(e) => setFollowScrubber(e.target.checked)} className="accent-indigo-500" />
+            <span className="shrink-0 whitespace-nowrap text-[10px] font-semibold tabular-nums text-white" title={pathLabel}>
+              Ch {fmtCh(currentKm)}
+            </span>
+            <span className="shrink-0 text-[9px] tabular-nums text-slate-500">{fmtCh(scrubToChainage(pathMode, 0))}</span>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.0005}
+              value={scrubT}
+              onChange={(e) => {
+                setPlaying(false)
+                setScrubT(Number(e.target.value))
+              }}
+              className={`h-1 min-w-0 flex-1 cursor-pointer ${pathAccentClass}`}
+            />
+            <span className="shrink-0 text-[9px] tabular-nums text-slate-500">{fmtCh(scrubToChainage(pathMode, 1))}</span>
+            <label className="inline-flex shrink-0 cursor-pointer items-center gap-1 text-[10px] text-slate-300">
+              <input type="checkbox" checked={followScrubber} onChange={(e) => setFollowScrubber(e.target.checked)} className="h-3 w-3 accent-indigo-500" />
               Follow
             </label>
           </div>
@@ -4098,18 +4712,36 @@ export default function NanasaRoad3DModal({
         )}
         </div>
         {!isMinimized && (
-          <div className="flex min-h-0 w-1/2 min-w-0 flex-col border-l border-white/10 bg-[#0b1220]">
+          <div className="flex min-h-0 w-[47%] min-w-0 flex-col border-l border-white/10 bg-[#0b1220]">
             <div className="relative z-0 h-[42%] shrink-0 overflow-hidden">
-              <CorridorLocationMap km={currentKm} winStart={chainageSlice.winStart} winEnd={chainageSlice.winEnd} />
+              <CorridorLocationMap
+                km={currentKm}
+                winStart={chainageSlice.winStart}
+                winEnd={chainageSlice.winEnd}
+                iriRecords={pmsRecords}
+                pathMode={pathMode}
+              />
+              {windowButtons}
             </div>
-            <div className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-hidden border-t border-white/10 p-2">
-              <button
-                type="button"
-                onClick={() => setShowGraphs((on) => !on)}
-                className="shrink-0 self-start rounded-full border border-white/20 bg-white/10 px-3 py-1 text-[12px] font-semibold text-white hover:bg-white/20"
-              >
-                {showGraphs ? 'Hide graphs' : 'View graphs'}
-              </button>
+            <div className="flex min-h-0 flex-1 flex-col overflow-hidden border-t border-white/10">
+              <div className="flex shrink-0 items-center justify-end gap-3 px-3 py-2">
+                <button
+                  type="button"
+                  onClick={() => setShowDetails((on) => !on)}
+                  aria-pressed={showDetails}
+                  aria-label={showDetails ? 'Show charts' : 'View full information'}
+                  title={showDetails ? 'Show charts' : 'Full information'}
+                  className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border transition ${showDetails ? 'border-white bg-white text-slate-900' : 'border-white/20 bg-white/10 text-white hover:bg-white/20'}`}
+                >
+                  <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden>
+                    <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.7" />
+                    <circle cx="12" cy="8" r="1.1" fill="currentColor" />
+                    <path d="M12 11.2v5.3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                  </svg>
+                </button>
+              </div>
+              {showDetails ? (
+              <div className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-hidden px-2 pb-2">
               {/* Pavement */}
               <div className="shrink-0 overflow-hidden rounded-2xl border border-white/10 bg-white/[0.04] p-2">
                 <div className="mb-1.5 flex shrink-0 items-center gap-1.5">
@@ -4163,16 +4795,6 @@ export default function NanasaRoad3DModal({
                     })}
                   </div>
                 )}
-                {showGraphs && iriTrend.length > 1 && (
-                  <div className="mt-1 border-t border-white/10 pt-1">
-                    <div className="flex items-center gap-3 px-1 text-[10px] font-semibold uppercase tracking-wide text-slate-400">
-                      <span>IRI over surveys</span>
-                      <span className="inline-flex items-center gap-1 normal-case tracking-normal text-slate-300"><i className="inline-block h-1.5 w-3 rounded-sm bg-[#facc15]" />L1</span>
-                      <span className="inline-flex items-center gap-1 normal-case tracking-normal text-slate-300"><i className="inline-block h-1.5 w-3 rounded-sm bg-[#38bdf8]" />L2</span>
-                    </div>
-                    <IriTrendChart points={iriTrend} activeDate={pavementDate} />
-                  </div>
-                )}
               </div>
 
               {/* Reported */}
@@ -4209,20 +4831,11 @@ export default function NanasaRoad3DModal({
                           {r.distress_type || 'Distress'}
                           <span className="ml-1.5 text-[11px] font-medium text-amber-200">
                             {String(r.direction || '').toLowerCase().startsWith('dec') ? '↘' : '↗'} {r.direction || '—'}
+                            {r.road === 'service' ? ' · Service Rd' : ''}
                             {r.area != null ? ` · ${Number(r.area).toFixed(1)} m²` : ''}
                             {Number.isFinite(Number(r.chainage_start)) ? ` · Ch ${Number(r.chainage_start).toFixed(3)}` : ''}
                           </span>
                         </span>
-                          <span
-                            className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold text-slate-900 [text-shadow:none]"
-                            style={{
-                              background:
-                                r.severity === 'High' ? '#ef4444' : r.severity === 'Medium' ? '#eab308' : '#16a34a',
-                              color: r.severity === 'Medium' ? '#0f172a' : '#fff',
-                            }}
-                          >
-                            {r.severity || 'Low'}
-                          </span>
                       </button>
                     ))}
                   </div>
@@ -4266,20 +4879,10 @@ export default function NanasaRoad3DModal({
                             {Number.isFinite(Number(r.chainage_start)) ? ` · Ch ${Number(r.chainage_start).toFixed(3)}` : ''}
                           </span>
                         </span>
-                          <span
-                            className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold text-slate-900 [text-shadow:none]"
-                            style={{
-                              background:
-                                r.severity === 'High' ? '#f472b6' : r.severity === 'Medium' ? '#a78bfa' : '#38bdf8',
-                            }}
-                          >
-                            {r.severity || 'Low'}
-                          </span>
                       </button>
                     ))}
                   </div>
                 )}
-                {showGraphs && <CountTrendChart points={predictedTrend} color="#38bdf8" />}
               </div>
               <div className="shrink-0 overflow-hidden rounded-2xl border border-white/10 bg-white/[0.04] p-2">
                 <div className="mb-1.5 flex shrink-0 items-center gap-1.5">
@@ -4328,8 +4931,70 @@ export default function NanasaRoad3DModal({
                   </div>
                 )}
               </div>
+              </div>
+              ) : (
+              <div className="flex min-h-0 flex-1 flex-col gap-2 px-2.5 pb-2.5">
+                <section className="flex min-h-0 flex-[1.35] flex-col overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-b from-white/[0.06] to-white/[0.02] p-2.5">
+                  <div className="mb-1 flex shrink-0 items-center justify-between gap-2">
+                    <p className="m-0 text-[13px] font-bold uppercase tracking-[0.14em] text-emerald-300">Roughness index</p>
+                    <div className="flex items-center gap-3 text-[13px] font-semibold text-slate-300">
+                      <span className="inline-flex items-center gap-1.5"><i className="inline-block h-1.5 w-3 rounded-full bg-[#facc15]" />L1</span>
+                      <span className="inline-flex items-center gap-1.5"><i className="inline-block h-1.5 w-3 rounded-full bg-[#38bdf8]" />L2</span>
+                    </div>
+                  </div>
+                  <div className="mb-1 grid shrink-0 grid-cols-2 gap-2">
+                    {['L1', 'L2'].map((lane) => {
+                      const point = iriTrend.find((p) => p.date === pavementDate) || iriTrend[iriTrend.length - 1]
+                      const iri = point?.[lane]
+                      const mm = Number.isFinite(Number(iri)) ? Math.round(Number(iri) * 1000) : null
+                      const band = iriBand({ iri, pavement: 'Bituminous' })
+                      return (
+                        <div key={lane} className="flex items-center justify-between gap-2 rounded-xl bg-black/25 px-2.5 py-1.5">
+                          <div className="min-w-0">
+                            <p className="m-0 text-[12px] font-semibold uppercase tracking-wide text-slate-400">{lane === 'L1' ? 'Median lane' : 'Outer lane'}</p>
+                            <p className="m-0 text-[22px] font-semibold tabular-nums leading-tight text-white">
+                              {mm == null ? '—' : mm.toLocaleString('en-IN')}
+                              <span className="ml-1 text-[13px] font-medium text-slate-400">mm/km</span>
+                            </p>
+                          </div>
+                          <span
+                            className="shrink-0 rounded-full px-2.5 py-1 text-[13px] font-bold"
+                            style={{
+                              background: band === 'good' ? '#111111' : band === 'fair' ? '#eab308' : band === 'poor' ? '#e2e8f0' : '#334155',
+                              color: band === 'poor' || band === 'fair' ? '#0f172a' : '#f8fafc',
+                            }}
+                          >
+                            {iriBandLabel(band)}
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                  <div className="min-h-0 flex-1">
+                    {iriTrend.length > 0 ? (
+                      <IriTrendChart points={iriTrend} activeDate={pavementDate} />
+                    ) : (
+                      <p className="m-0 px-1 py-6 text-center text-[12px] text-slate-400">No roughness surveys in this window</p>
+                    )}
+                  </div>
+                </section>
+                <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-b from-white/[0.06] to-white/[0.02] p-2.5">
+                  <div className="mb-1 flex shrink-0 items-center justify-between gap-2">
+                    <p className="m-0 text-[13px] font-bold uppercase tracking-[0.14em] text-cyan-300">Predicted distress</p>
+                    <span className="text-[13px] font-medium text-slate-400">Count in this window</span>
+                  </div>
+                  <div className="min-h-0 flex-1">
+                    {predictedTrend.some((p) => p.n) ? (
+                      <CountTrendChart points={predictedTrend} activeDate={predictedTrend[predictedTrend.length - 1]?.date} />
+                    ) : (
+                      <p className="m-0 px-1 py-6 text-center text-[12px] text-slate-400">No predicted distress in this window</p>
+                    )}
+                  </div>
+                </section>
+              </div>
+              )}
           {selectedReported && (
-            <div className="pointer-events-auto shrink-0 overflow-hidden rounded-xl border border-white/15 bg-black/75 p-2 shadow-xl">
+            <div className="pointer-events-auto mx-2 mb-2 shrink-0 overflow-hidden rounded-xl border border-white/15 bg-black/75 p-2 shadow-xl">
               <div className="mb-2 flex items-start justify-between gap-2">
                 <div>
                   <p className="m-0 text-[10px] font-semibold uppercase tracking-wide text-slate-400">Reported distress</p>
@@ -4343,21 +5008,6 @@ export default function NanasaRoad3DModal({
                 >
                   ✕
                 </button>
-              </div>
-              <div className="mb-2">
-                <span
-                  className="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] font-semibold text-white"
-                  style={{
-                    background:
-                      selectedReported.severity === 'High'
-                        ? '#ef4444'
-                        : selectedReported.severity === 'Medium'
-                          ? '#ca8a04'
-                          : '#16a34a',
-                  }}
-                >
-                  {selectedReported.severity || 'Low'}
-                </span>
               </div>
               <dl className="m-0 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12px]">
                 {[
