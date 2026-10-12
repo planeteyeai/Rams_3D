@@ -310,7 +310,7 @@ export default function ProjectCardsPage() {
                   tabIndex={0}
                   className={`flex w-full shrink-0 cursor-pointer gap-3 overflow-hidden rounded-2xl border bg-white p-2 text-left shadow-sm transition ${detailed ? 'h-[40rem]' : 'h-28'} ${on ? 'border-indigo-500 shadow-[0_10px_28px_rgba(67,56,202,0.12)]' : 'border-indigo-100 hover:border-indigo-300'}`}
                 >
-                  <div className="pointer-events-none relative h-full w-[min(420px,34vw)] shrink-0 overflow-hidden rounded-xl bg-slate-200">
+                  <div className="pointer-events-none relative h-full w-[min(680px,48vw)] shrink-0 overflow-hidden rounded-xl bg-slate-200">
                     <ProjectMiniMap project={p} from={detailed ? roadFrom : undefined} to={detailed ? roadTo : undefined} />
                     <span className="absolute bottom-1 right-1.5 text-[9px] font-medium text-white/90 [text-shadow:0_1px_2px_rgba(0,0,0,0.8)]">© Google</span>
                   </div>

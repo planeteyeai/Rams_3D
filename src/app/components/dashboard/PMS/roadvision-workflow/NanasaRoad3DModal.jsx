@@ -5,6 +5,7 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js'
 import medianData from '../../../../../assets/data/nanasa-median.json'
+import RoadAadtBadge from './RoadAadtBadge'
 import reportedData from '../../../../../assets/data/adani-reported.json'
 import predictedData from '../../../../../assets/data/adani-predicted.json'
 import pmsData from '../../../../../assets/data/adani-pms.json'
@@ -20,6 +21,7 @@ import {
   sampleAtDistance,
   sampleChainageShoulder,
 } from './road3dGeometry'
+import { createSurroundingsGroup, disposeSurroundings, loadSurroundings } from './osmSurroundings'
 
 const CHAINAGE_MIN_KM = 95
 const CHAINAGE_MAX_KM = 142.94
@@ -3422,7 +3424,7 @@ function IriTrendChart({ points, activeDate }) {
   )
 }
 
-function CountTrendChart({ points, activeDate, color = '#38bdf8' }) {
+function CountTrendChart({ points, activeDate, color = '#38bdf8', label = 'Distress over survey dates' }) {
   const rows = points || []
   if (!rows.length) return null
   const w = 1100
@@ -3435,7 +3437,7 @@ function CountTrendChart({ points, activeDate, color = '#38bdf8' }) {
   const used = rows.length * barW + (rows.length - 1) * gap
   const origin = pad.l + (innerW - used) / 2
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} className="block h-full min-h-0 w-full" role="img" aria-label="Predicted distress over survey dates" preserveAspectRatio="xMidYMid meet">
+    <svg viewBox={`0 0 ${w} ${h}`} className="block h-full min-h-0 w-full" role="img" aria-label={label} preserveAspectRatio="xMidYMid meet">
       <defs>
         <linearGradient id="predBar" x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor={color} stopOpacity="1" />
@@ -3494,6 +3496,7 @@ export default function NanasaRoad3DModal({
   const [pavementDate, setPavementDate] = useState(
     () => pavementDateProp || pmsData.dates?.[0] || '',
   )
+  const [osmStatus, setOsmStatus] = useState('')
 
   useEffect(() => {
     if (!open) return
@@ -3861,6 +3864,19 @@ export default function NanasaRoad3DModal({
     })
   }, [predictedIndex, chainageSlice.winStart, chainageSlice.winEnd, pathMode])
 
+  const reportedTrend = useMemo(() => {
+    const dates = [...new Set(reportedRecords.map((r) => r.date).filter(Boolean))].sort()
+    return dates.map((date) => ({
+      date,
+      n: reportedRecords.filter((r) => {
+        if (r.date !== date) return false
+        if (!matchesPathRoad(r, pathMode)) return false
+        if (!overlapsKm(r.chainage_start, r.chainage_end ?? r.chainage_start, chainageSlice.winStart, chainageSlice.winEnd)) return false
+        return matchesPathDir(r.direction, pathMode)
+      }).length,
+    }))
+  }, [reportedRecords, chainageSlice.winStart, chainageSlice.winEnd, pathMode])
+
   const syncScrubTargets = useCallback((mode, t, follow) => {
     const rt = runtime.current
     const sr = scrubRef.current
@@ -4054,6 +4070,8 @@ export default function NanasaRoad3DModal({
 
     runtime.current = {
       points,
+      origin,
+      root,
       lhsMarker: null,
       rhsMarker: null,
       medMarker: null,
@@ -4235,6 +4253,32 @@ export default function NanasaRoad3DModal({
     }
   }, [open, corridor, invPoints, invLines, pmsRecords, reportedRecords, predictedRecords])
 
+  useEffect(() => {
+    if (!open || sceneLoading) return undefined
+    const rt = runtime.current
+    if (!rt?.root || !rt.origin) return undefined
+    let stale = false
+    Promise.resolve(loadSurroundings(medianData.coordinates, rt.origin)).then((features) => {
+      if (stale || runtime.current?.root !== rt.root) return
+      const previous = rt.root.getObjectByName('osmSurroundings')
+      if (previous) {
+        rt.root.remove(previous)
+        disposeSurroundings(previous)
+      }
+      const group = createSurroundingsGroup(features, rt.origin)
+      rt.root.add(group)
+      const counts = group.userData.counts || {}
+      const parts = []
+      if (counts.buildings) parts.push(`${counts.buildings} buildings`)
+      if (counts.trees) parts.push(`${counts.trees} trees`)
+      if (counts.structures) parts.push(`${counts.structures} structures`)
+      setOsmStatus(parts.length ? `${parts.join(' · ')} within 200 m` : 'No mapped buildings or trees in this stretch')
+    })
+    return () => {
+      stale = true
+    }
+  }, [open, sceneLoading])
+
   if (!open) return null
 
   const fmtCh = (n) => (Math.abs(n - Math.round(n)) < 0.05 ? `${Math.round(n)}` : n.toFixed(2))
@@ -4367,6 +4411,9 @@ export default function NanasaRoad3DModal({
     },
   ].filter(Boolean)
 
+  const distressChartPredicted = predictedFilter !== 'off' && reportedFilter === 'off'
+  const distressTrend = distressChartPredicted ? predictedTrend : reportedTrend
+
   const isFullscreen = chromeMode === 'fullscreen'
   const isMinimized = chromeMode === 'minimized'
   const shellClass = isFullscreen
@@ -4473,6 +4520,38 @@ export default function NanasaRoad3DModal({
           <div className="pointer-events-none absolute left-4 top-4 z-20 [text-shadow:0_2px_4px_rgba(0,0,0,0.95),0_0_10px_rgba(0,0,0,0.8)]">
             <p className="m-0 text-[12px] font-bold uppercase tracking-[0.16em] text-slate-100">Road type</p>
             <p className="m-0 text-[22px] font-extrabold leading-tight text-white">{roadType}</p>
+            {osmStatus && (
+              <p className="m-0 mt-1 max-w-[240px] text-[12px] font-semibold text-white">{osmStatus}</p>
+            )}
+          </div>
+        )}
+        {!isMinimized && (
+          <div className="pointer-events-none absolute right-4 top-4 z-20 flex flex-col items-end gap-2">
+            <div className="pointer-events-auto flex overflow-hidden rounded-full border border-white/40 bg-black/50 text-[12px] font-semibold text-white shadow backdrop-blur">
+              <button
+                type="button"
+                onClick={() => {
+                  setReportedFilter('all')
+                  setPredictedFilter('off')
+                }}
+                aria-pressed={reportedFilter !== 'off' && predictedFilter === 'off'}
+                className={`px-3 py-1.5 ${reportedFilter !== 'off' && predictedFilter === 'off' ? 'bg-white text-slate-900' : 'hover:bg-white/15'}`}
+              >
+                Reported
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setReportedFilter('off')
+                  setPredictedFilter('all')
+                }}
+                aria-pressed={predictedFilter !== 'off' && reportedFilter === 'off'}
+                className={`px-3 py-1.5 ${predictedFilter !== 'off' && reportedFilter === 'off' ? 'bg-white text-slate-900' : 'hover:bg-white/15'}`}
+              >
+                Predicted
+              </button>
+            </div>
+            <RoadAadtBadge />
           </div>
         )}
         {isMinimized ? (
@@ -4980,14 +5059,23 @@ export default function NanasaRoad3DModal({
                 </section>
                 <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-b from-white/[0.06] to-white/[0.02] p-2.5">
                   <div className="mb-1 flex shrink-0 items-center justify-between gap-2">
-                    <p className="m-0 text-[13px] font-bold uppercase tracking-[0.14em] text-cyan-300">Predicted distress</p>
+                    <p className={`m-0 text-[13px] font-bold uppercase tracking-[0.14em] ${distressChartPredicted ? 'text-cyan-300' : 'text-amber-300'}`}>
+                      {distressChartPredicted ? 'Predicted distress' : 'Reported distress'}
+                    </p>
                     <span className="text-[13px] font-medium text-slate-400">Count in this window</span>
                   </div>
                   <div className="min-h-0 flex-1">
-                    {predictedTrend.some((p) => p.n) ? (
-                      <CountTrendChart points={predictedTrend} activeDate={predictedTrend[predictedTrend.length - 1]?.date} />
+                    {distressTrend.some((p) => p.n) ? (
+                      <CountTrendChart
+                        points={distressTrend}
+                        activeDate={distressTrend.at(-1)?.date}
+                        color={distressChartPredicted ? '#38bdf8' : '#f59e0b'}
+                        label={distressChartPredicted ? 'Predicted distress over survey dates' : 'Reported distress over survey dates'}
+                      />
                     ) : (
-                      <p className="m-0 px-1 py-6 text-center text-[12px] text-slate-400">No predicted distress in this window</p>
+                      <p className="m-0 px-1 py-6 text-center text-[12px] text-slate-400">
+                        {distressChartPredicted ? 'No predicted distress in this window' : 'No reported distress in this window'}
+                      </p>
                     )}
                   </div>
                 </section>
