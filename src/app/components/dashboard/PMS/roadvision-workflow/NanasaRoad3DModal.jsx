@@ -22,6 +22,7 @@ import {
   sampleChainageShoulder,
 } from './road3dGeometry'
 import { createSurroundingsGroup, disposeSurroundings, loadSurroundings } from './osmSurroundings'
+import CorridorBuildingsMap from './CorridorBuildingsMap'
 
 const CHAINAGE_MIN_KM = 95
 const CHAINAGE_MAX_KM = 142.94
@@ -47,16 +48,12 @@ const IRI_COLORS = {
   na: 0x94a3b8,
 }
 
-/** Reported = traffic-light patches; Predicted = cool-tone markers (easy to tell apart when both on). */
+/** Distress is always bright red so it reads on the carriageway. */
+const DISTRESS_RED = 0xff2a2a
 const REPORTED_SEV_COLORS = {
-  Low: 0x22c55e,
-  Medium: 0xfacc15,
-  High: 0xef4444,
-}
-const PREDICTED_SEV_COLORS = {
-  Low: 0x38bdf8,
-  Medium: 0xa78bfa,
-  High: 0xf472b6,
+  Low: DISTRESS_RED,
+  Medium: DISTRESS_RED,
+  High: DISTRESS_RED,
 }
 
 function iriCap(pavement) {
@@ -644,7 +641,6 @@ function addDistressLayer(root, records, origin, medianPts, name, scale = 1, asP
   const layer = new THREE.Group()
   layer.name = name
   layer.renderOrder = asPatch ? 12 : 14
-  const palette = asPatch ? REPORTED_SEV_COLORS : PREDICTED_SEV_COLORS
   const buckets = {
     Low: [],
     Medium: [],
@@ -665,39 +661,25 @@ function addDistressLayer(root, records, origin, medianPts, name, scale = 1, asP
   const dummy = new THREE.Object3D()
   // Pavement overlays sit ~0.05–0.055; keep distress clearly above
   const PATCH_BASE_Y = 0.09
+  layer.userData.blinkMats = []
 
   if (asPatch) {
     Object.entries(buckets).forEach(([sev, list]) => {
       if (!list.length) return
-      const color = palette[sev]
-      const mat = new THREE.MeshStandardMaterial({
-        color,
-        emissive: color,
-        emissiveIntensity: sev === 'High' ? 0.35 : sev === 'Medium' ? 0.22 : 0.12,
-        roughness: 0.72,
-        metalness: 0.04,
+      const mat = new THREE.MeshBasicMaterial({
+        color: DISTRESS_RED,
         transparent: true,
-        opacity: sev === 'High' ? 0.88 : sev === 'Medium' ? 0.78 : 0.68,
+        opacity: 0.92,
         depthWrite: false,
+        toneMapped: false,
         side: THREE.DoubleSide,
         polygonOffset: true,
         polygonOffsetFactor: -2,
         polygonOffsetUnits: -2,
       })
+      layer.userData.blinkMats.push(mat)
       const mesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), mat, list.length)
       mesh.renderOrder = 12
-      const outline = new THREE.InstancedMesh(
-        new THREE.BoxGeometry(1, 1, 1),
-        new THREE.MeshBasicMaterial({
-          color: 0x0f172a,
-          transparent: true,
-          opacity: 0.55,
-          depthWrite: false,
-          depthTest: true,
-        }),
-        list.length,
-      )
-      outline.renderOrder = 13
       const pickRecords = []
       list.forEach((p, i) => {
         const h = sev === 'High' ? 0.12 : sev === 'Medium' ? 0.09 : 0.07
@@ -706,22 +688,14 @@ function addDistressLayer(root, records, origin, medianPts, name, scale = 1, asP
         dummy.scale.set(p.widthM, h, p.lengthM)
         dummy.updateMatrix()
         mesh.setMatrixAt(i, dummy.matrix)
-        dummy.position.y = PATCH_BASE_Y + h + 0.012
-        dummy.scale.set(p.widthM + 0.1, 0.014, p.lengthM + 0.1)
-        dummy.updateMatrix()
-        outline.setMatrixAt(i, dummy.matrix)
         pickRecords.push(p.record)
       })
       mesh.instanceMatrix.needsUpdate = true
-      outline.instanceMatrix.needsUpdate = true
       mesh.userData.severity = sev.toLowerCase()
       mesh.userData.pickable = true
       mesh.userData.records = pickRecords
-      outline.userData.severity = sev.toLowerCase()
-      outline.userData.pickable = true
-      outline.userData.records = pickRecords
       mesh.receiveShadow = true
-      layer.add(mesh, outline)
+      layer.add(mesh)
     })
     root.add(layer)
     return layer
@@ -733,21 +707,25 @@ function addDistressLayer(root, records, origin, medianPts, name, scale = 1, asP
 
   Object.entries(buckets).forEach(([sev, list]) => {
     if (!list.length) return
-    const color = palette[sev]
-    const mat = new THREE.MeshStandardMaterial({
-      color,
-      emissive: color,
-      emissiveIntensity: 0.45,
-      roughness: 0.35,
-      metalness: 0.15,
+    const mat = new THREE.MeshBasicMaterial({
+      color: DISTRESS_RED,
+      transparent: true,
+      opacity: 0.92,
+      depthWrite: false,
+      toneMapped: false,
     })
+    const ringMat = new THREE.MeshBasicMaterial({
+      color: DISTRESS_RED,
+      transparent: true,
+      opacity: 0.92,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      toneMapped: false,
+    })
+    layer.userData.blinkMats.push(mat, ringMat)
     const mesh = new THREE.InstancedMesh(geo, mat, list.length)
     mesh.renderOrder = 14
-    const rings = new THREE.InstancedMesh(
-      ringGeo,
-      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.7, side: THREE.DoubleSide }),
-      list.length,
-    )
+    const rings = new THREE.InstancedMesh(ringGeo, ringMat, list.length)
     rings.renderOrder = 14
     list.forEach((p, i) => {
       dummy.position.set(p.x, 1.05 * scale, p.z)
@@ -1314,15 +1292,163 @@ function addKitToScene(root, kit) {
   })
 }
 
+/** 1…N along chainage, stable when two assets share a chainage. */
+function chainageNumbers(list) {
+  const num = new Map()
+  ;[...list]
+    .sort((a, b) => (Number(a.start) || 0) - (Number(b.start) || 0) || (Number(a.i) || 0) - (Number(b.i) || 0))
+    .forEach((p, n) => num.set(p.i, n + 1))
+  return num
+}
+
+/** Plate faces oncoming traffic for this side. Median faces the increasing carriageway. */
+function roadFacingYaw(medianPts, x, z, dir) {
+  if (!medianPts?.length) return 0
+  const f = nearestMedianFrame({ x, z }, medianPts)
+  const dec = String(dir || '').toLowerCase().startsWith('dec')
+  return dec ? Math.atan2(f.tx, f.tz) : Math.atan2(-f.tx, -f.tz)
+}
+
+let numberDigitAtlasTex = null
+function numberDigitAtlas() {
+  if (numberDigitAtlasTex) return numberDigitAtlasTex
+  const cell = 64
+  const c = document.createElement('canvas')
+  c.width = cell * 10
+  c.height = cell
+  const g = c.getContext('2d')
+  g.clearRect(0, 0, c.width, c.height)
+  g.font = '700 52px Segoe UI, Arial, sans-serif'
+  g.textAlign = 'center'
+  g.textBaseline = 'middle'
+  g.fillStyle = '#ffffff'
+  for (let d = 0; d < 10; d++) g.fillText(String(d), d * cell + cell / 2, cell / 2 + 2)
+  const tex = new THREE.CanvasTexture(c)
+  tex.colorSpace = THREE.SRGBColorSpace
+  tex.magFilter = THREE.LinearFilter
+  tex.minFilter = THREE.LinearFilter
+  tex.generateMipmaps = false
+  numberDigitAtlasTex = tex
+  return tex
+}
+
+/**
+ * Small number plate on each asset, drawn on both faces so it reads while orbiting.
+ * `n` is the chainage sequence for that asset type.
+ */
+function addNumberLabels(root, labels, opt = {}) {
+  const digitW = opt.digitW ?? 0.24
+  const digitH = opt.digitH ?? 0.38
+  const liftZ = opt.liftZ ?? 0.14
+  const usable = (labels || []).filter((lb) => Number.isFinite(lb.n) && lb.n > 0)
+  if (!usable.length) return
+
+  const buckets = Array.from({ length: 10 }, () => [])
+  const plates = []
+  usable.forEach((lb) => {
+    const text = String(lb.n)
+    const len = text.length
+    for (const yaw of [lb.yaw || 0, (lb.yaw || 0) + Math.PI]) {
+      plates.push({
+        x: lb.x,
+        z: lb.z,
+        y: lb.y,
+        yaw,
+        w: len * digitW + digitW * 0.5,
+        h: digitH * 1.28,
+      })
+      for (let s = 0; s < len; s++) {
+        const d = text.charCodeAt(s) - 48
+        if (d < 0 || d > 9) continue
+        buckets[d].push({
+          x: lb.x,
+          z: lb.z,
+          y: lb.y,
+          yaw,
+          ox: (s - (len - 1) / 2) * digitW,
+        })
+      }
+    }
+  })
+
+  const dummy = new THREE.Object3D()
+  const local = new THREE.Object3D()
+  const composed = new THREE.Matrix4()
+  const place = (mesh, i, p, ox, oy, oz, sx, sy) => {
+    dummy.position.set(p.x, 0, p.z)
+    dummy.rotation.set(0, p.yaw, 0)
+    dummy.updateMatrix()
+    local.position.set(ox, oy, oz)
+    local.rotation.set(0, 0, 0)
+    local.scale.set(sx, sy, 1)
+    local.updateMatrix()
+    composed.multiplyMatrices(dummy.matrix, local.matrix)
+    mesh.setMatrixAt(i, composed)
+  }
+
+  const plate = new THREE.InstancedMesh(
+    new THREE.PlaneGeometry(1, 1),
+    new THREE.MeshBasicMaterial({ color: opt.plate ?? 0x12151c, toneMapped: false }),
+    plates.length,
+  )
+  plates.forEach((p, i) => place(plate, i, p, 0, p.y, liftZ, p.w, p.h))
+  plate.instanceMatrix.needsUpdate = true
+  plate.frustumCulled = false
+  root.add(plate)
+
+  const atlas = numberDigitAtlas()
+  buckets.forEach((list, d) => {
+    if (!list.length) return
+    const map = atlas.clone()
+    map.repeat.set(0.1, 1)
+    map.offset.set(d * 0.1, 0)
+    const mesh = new THREE.InstancedMesh(
+      new THREE.PlaneGeometry(digitW, digitH),
+      new THREE.MeshBasicMaterial({
+        map,
+        color: opt.tint ?? 0xffffff,
+        transparent: true,
+        alphaTest: 0.45,
+        depthWrite: false,
+        toneMapped: false,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -2,
+      }),
+      list.length,
+    )
+    list.forEach((p, i) => place(mesh, i, p, p.ox, p.y, liftZ + 0.025, 1, 1))
+    mesh.instanceMatrix.needsUpdate = true
+    mesh.frustumCulled = false
+    root.add(mesh)
+  })
+}
+
+/** World position of a plate that sits in a group's local frame. */
+function yawLabel(x, z, yaw, lx, y, lz, n) {
+  const c = Math.cos(yaw)
+  const s = Math.sin(yaw)
+  return { x: x + lx * c + lz * s, z: z - lx * s + lz * c, y, yaw, n }
+}
+
 /** Highway cobra-head: single-arm on outer edges, double-arm on median. */
 function addStreetLights(root, list, origin, medianPts) {
   if (!list?.length) return 0
   const singles = []
   const doubles = []
+  const labels = []
+  const nums = chainageNumbers(list)
   list.forEach((p) => {
     const placed = placeStreetLight(p, origin, medianPts)
     if (placed.doubleArm) doubles.push(placed)
     else singles.push(placed)
+    labels.push({
+      x: placed.x,
+      z: placed.z,
+      y: 4.4,
+      yaw: roadFacingYaw(medianPts, placed.x, placed.z, p.dir),
+      n: nums.get(p.i),
+    })
   })
 
   const dummy = new THREE.Object3D()
@@ -1364,6 +1490,13 @@ function addStreetLights(root, list, origin, medianPts) {
     })
   }
 
+  addNumberLabels(root, labels, {
+    digitW: 0.32,
+    digitH: 0.5,
+    liftZ: 0.18,
+    plate: 0x1c1408,
+    tint: 0xffe08a,
+  })
   return list.length
 }
 
@@ -1444,10 +1577,19 @@ function addTrees(root, list, origin, medianPts) {
     { mesh: canopyTop, ox: 0.06, oy: 3.7, oz: 0.02, sx: 1, sy: 1, sz: 1 },
   ]
 
+  const treeNums = chainageNumbers(list)
+  const treeLabels = []
   list.forEach((p, i) => {
     const loc = placeTreeOffRoad(p, i, origin, medianPts)
     const s = 0.78 + hash01(i, 1) * 0.55
     const yaw = hash01(i, 2) * Math.PI * 2
+    treeLabels.push({
+      x: loc.x,
+      z: loc.z,
+      y: 1.35 * s,
+      yaw: roadFacingYaw(medianPts, loc.x, loc.z, p.dir),
+      n: treeNums.get(p.i),
+    })
     dummy.position.set(loc.x, 0, loc.z)
     dummy.rotation.set(0, yaw, 0)
     dummy.scale.set(s, s, s)
@@ -1470,6 +1612,13 @@ function addTrees(root, list, origin, medianPts) {
     part.mesh.receiveShadow = false
     part.mesh.frustumCulled = true
     root.add(part.mesh)
+  })
+  addNumberLabels(root, treeLabels, {
+    digitW: 0.22,
+    digitH: 0.36,
+    liftZ: 0.32,
+    plate: 0x14210f,
+    tint: 0xffffff,
   })
   return count
 }
@@ -1789,7 +1938,7 @@ function addInstancedKit(root, placements, specs) {
   })
 }
 
-function addRoadFurniture(root, list, asset, origin, medianPts) {
+function addRoadFurniture(root, list, asset, origin, medianPts, signNums) {
   const placements = list.map((p) => placeOnCorridor(p, origin, medianPts))
   const steel = new THREE.MeshStandardMaterial({ color: 0x5b6570, metalness: 0.55, roughness: 0.35 })
   const conc = new THREE.MeshStandardMaterial({ color: 0xc5ccd3, roughness: 0.82, metalness: 0.04 })
@@ -1802,11 +1951,19 @@ function addRoadFurniture(root, list, asset, origin, medianPts) {
   const roof = new THREE.MeshStandardMaterial({ color: 0x37474f, metalness: 0.4, roughness: 0.4 })
 
   if (asset === 'Sign Boards') {
-    addInstancedKit(root, list.map((p) => placeSignBoard(p, origin, medianPts)), [
+    const placements = list.map((p) => placeSignBoard(p, origin, medianPts))
+    addInstancedKit(root, placements, [
       { geo: new THREE.CylinderGeometry(0.045, 0.055, 2.7, 8), mat: steel, oy: 1.35 },
       { geo: new THREE.BoxGeometry(1.15, 0.95, 0.06), mat: green, oy: 2.85, oz: 0.04 },
       { geo: new THREE.BoxGeometry(0.95, 0.72, 0.03), mat: white, oy: 2.85, oz: 0.08 },
     ])
+    if (signNums) {
+      addNumberLabels(
+        root,
+        placements.map((pl, i) => ({ x: pl.x, z: pl.z, y: 2.85, yaw: pl.yaw || 0, n: signNums.get(list[i].i) })),
+        { digitW: 0.2, digitH: 0.34, liftZ: 0.13, plate: 0x0c3d22, tint: 0xffffff },
+      )
+    }
     return list.length
   }
   if (asset === 'Hazard Markers') {
@@ -2106,6 +2263,23 @@ function addMedianPlants(root, list, origin, medianPts) {
     mesh.computeBoundingSphere()
     root.add(mesh)
   })
+
+  const medianNums = chainageNumbers(list)
+  addNumberLabels(
+    root,
+    list.map((p) => {
+      const km = (Number(p.start) + Number(p.end ?? p.start)) / 2
+      const f = chainageFrame(medianPts, km)
+      return {
+        x: f.x + f.nx * 0.85,
+        z: f.z + f.nz * 0.85,
+        y: 3.2,
+        yaw: Math.atan2(-f.tx, -f.tz),
+        n: medianNums.get(p.i),
+      }
+    }),
+    { digitW: 0.2, digitH: 0.32, liftZ: 0.12, plate: 0x163018, tint: 0xd8ffc4 },
+  )
   return list.length
 }
 
@@ -2206,7 +2380,7 @@ function gantryClusters(list) {
  * pedestals, angled braces, twin cross-beams and a green 4-panel
  * bilingual direction board facing oncoming traffic.
  */
-function addGantrySigns(root, list, medianPts) {
+function addGantrySigns(root, list, medianPts, signNums) {
   if (!list?.length || !medianPts?.length) return 0
   const steel = new THREE.MeshStandardMaterial({ color: 0x9aa3c2, metalness: 0.7, roughness: 0.3 })
   const pedestal = new THREE.MeshStandardMaterial({ color: 0x4b5585, metalness: 0.5, roughness: 0.4 })
@@ -2223,6 +2397,7 @@ function addGantrySigns(root, list, medianPts) {
   const beamYs = [5.85, 6.85]
 
   const clusters = gantryClusters(list)
+  const gantryLabels = []
   clusters.forEach(({ dir, km }) => {
     const f = chainageFrame(medianPts, km)
     const sideSign = dirSideSign(dir)
@@ -2284,6 +2459,23 @@ function addGantrySigns(root, list, medianPts) {
       }
     })
     root.add(grp)
+    if (signNums) {
+      const members = list.filter((p) => {
+        const side = String(p.dir || '').toLowerCase().startsWith('dec') ? 'Decreasing' : 'Increasing'
+        return side === dir && Math.abs(Number(p.start) - km) < 0.2
+      })
+      members.forEach((p, mi) => {
+        const ox = (mi - (members.length - 1) / 2) * Math.min(1.5, (boardW - 1) / Math.max(1, members.length))
+        gantryLabels.push(yawLabel(grp.position.x, grp.position.z, grp.rotation.y, ox, boardY, 0, signNums.get(p.i)))
+      })
+    }
+  })
+  addNumberLabels(root, gantryLabels, {
+    digitW: 0.36,
+    digitH: 0.55,
+    liftZ: 0.42,
+    plate: 0x08301c,
+    tint: 0xffffff,
   })
   return list.length
 }
@@ -2343,7 +2535,7 @@ function cantileverBoardTexture(seed) {
  * bends over into a horizontal arm carrying a green 2-panel direction board
  * above the near lanes, facing oncoming traffic.
  */
-function addCantileverSigns(root, list, medianPts) {
+function addCantileverSigns(root, list, medianPts, signNums) {
   if (!list?.length || !medianPts?.length) return 0
   const steel = new THREE.MeshStandardMaterial({ color: 0x8d9197, metalness: 0.65, roughness: 0.35 })
   const footing = new THREE.MeshStandardMaterial({ color: 0xb9bec4, roughness: 0.9, metalness: 0 })
@@ -2359,6 +2551,7 @@ function addCantileverSigns(root, list, medianPts) {
   const boardX0 = bendR + 0.15
 
   const sites = []
+  const cantileverLabels = []
   ;[...list]
     .filter((p) => /^(inc|dec)/i.test(String(p.dir || '')))
     .sort((a, b) => a.start - b.start)
@@ -2425,6 +2618,23 @@ function addCantileverSigns(root, list, medianPts) {
       }
     })
     root.add(grp)
+    if (signNums) {
+      const members = list.filter((p) => {
+        const side = String(p.dir || '').toLowerCase().startsWith('dec') ? 'Decreasing' : 'Increasing'
+        return side === dir && Math.abs(Number(p.start) - km) < 0.05
+      })
+      members.forEach((p, mi) => {
+        const ox = ax * (boardX0 + boardW / 2) + (mi - (members.length - 1) / 2) * 0.9
+        cantileverLabels.push(yawLabel(grp.position.x, grp.position.z, grp.rotation.y, ox, armY - 0.1, 0, signNums.get(p.i)))
+      })
+    }
+  })
+  addNumberLabels(root, cantileverLabels, {
+    digitW: 0.34,
+    digitH: 0.5,
+    liftZ: 0.3,
+    plate: 0x08301c,
+    tint: 0xffffff,
   })
   return list.length
 }
@@ -2493,7 +2703,7 @@ function stripedPostTexture() {
 }
 
 /** Mandatory sign: red octagon plate on a black-and-white striped post with a black base plate. */
-function addMandatorySigns(root, list, origin, medianPts) {
+function addMandatorySigns(root, list, origin, medianPts, signNums) {
   if (!list?.length) return 0
   const r = 0.42
   const depth = 0.02
@@ -2515,12 +2725,20 @@ function addMandatorySigns(root, list, origin, medianPts) {
   const postMat = new THREE.MeshStandardMaterial({ map: stripedPostTexture(), roughness: 0.55, metalness: 0.1 })
   const baseMat = new THREE.MeshStandardMaterial({ color: 0x151515, roughness: 0.6, metalness: 0.2 })
 
-  addInstancedKit(root, list.map((p) => placeSignBoard(p, origin, medianPts)), [
+  const placements = list.map((p) => placeSignBoard(p, origin, medianPts))
+  addInstancedKit(root, placements, [
     { geo: new THREE.BoxGeometry(0.42, 0.05, 0.3), mat: baseMat, oy: 0.025 },
     { geo: new THREE.CylinderGeometry(0.035, 0.035, postH, 12), mat: postMat, oy: postH / 2 + 0.05 },
     { geo: plateGeo, mat: plateMat, oy: postH + 0.05, oz: 0.04 },
     { geo: faceGeo, mat: faceMat, oy: postH + 0.05, oz: 0.04 },
   ])
+  if (signNums) {
+    addNumberLabels(
+      root,
+      placements.map((pl, i) => ({ x: pl.x, z: pl.z, y: postH + 0.05, yaw: pl.yaw || 0, n: signNums.get(list[i].i) })),
+      { digitW: 0.15, digitH: 0.24, liftZ: 0.1, plate: 0x3a0a0a, tint: 0xffffff },
+    )
+  }
   return list.length
 }
 
@@ -2560,10 +2778,11 @@ function addInventoryPoints(root, items, origin, medianPts) {
       const cantilevers = list.filter((p) => /cantilever/i.test(p.sub || ''))
       const mandatory = list.filter((p) => /mandatory/i.test(p.sub || ''))
       const boards = list.filter((p) => !/gantry|cantilever|mandatory/i.test(p.sub || ''))
-      n += addGantrySigns(root, gantries, medianPts)
-      n += addCantileverSigns(root, cantilevers, medianPts)
-      n += addMandatorySigns(root, mandatory, origin, medianPts)
-      if (boards.length) n += addRoadFurniture(root, boards, asset, origin, medianPts)
+      const signNums = chainageNumbers(list)
+      n += addGantrySigns(root, gantries, medianPts, signNums)
+      n += addCantileverSigns(root, cantilevers, medianPts, signNums)
+      n += addMandatorySigns(root, mandatory, origin, medianPts, signNums)
+      if (boards.length) n += addRoadFurniture(root, boards, asset, origin, medianPts, signNums)
       return
     }
     n += addRoadFurniture(root, list, asset, origin, medianPts)
@@ -3209,6 +3428,46 @@ function prefetchCorridorTiles(map, km, pathMode) {
   })
 }
 
+function roadAnalysisGeo(iriRecords, pathMode) {
+  const runs = iriRunsForMap(iriRecords, pathMode)
+  const features = []
+  if (runs.length) {
+    runs.forEach((run) => {
+      const pts = lanePoints(run.start, run.end, run.side, laneOffsetM(run.lane))
+      features.push({
+        type: 'Feature',
+        properties: { color: IRI_MAP_COLORS[run.band] || IRI_MAP_COLORS.na },
+        geometry: { type: 'LineString', coordinates: pts.map(([lat, lng]) => [lng, lat]) },
+      })
+    })
+  } else if ((medianData.coordinates || []).length > 1) {
+    features.push({
+      type: 'Feature',
+      properties: { color: '#f59e0b' },
+      geometry: { type: 'LineString', coordinates: medianData.coordinates },
+    })
+  }
+  return { type: 'FeatureCollection', features }
+}
+
+function windowAnalysisGeo(winStart, winEnd, pathMode) {
+  const features = []
+  if (Number.isFinite(winStart) && Number.isFinite(winEnd) && winEnd > winStart) {
+    const side = pathModeSideSign(pathMode === 'median' ? 'lhs' : pathMode) || SIDE_LHS
+    const sides = pathMode === 'median' ? [SIDE_LHS, SIDE_RHS] : [side]
+    sides.forEach((s) => {
+      const ring = carriageOutline(winStart, winEnd, s)
+      if (!ring?.length) return
+      const coordinates = ring.map(([lat, lng]) => [lng, lat])
+      const first = coordinates[0]
+      const last = coordinates[coordinates.length - 1]
+      if (first[0] !== last[0] || first[1] !== last[1]) coordinates.push(first)
+      features.push({ type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [coordinates] } })
+    })
+  }
+  return { type: 'FeatureCollection', features }
+}
+
 /** Small map of the corridor. The road is coloured by IRI: good, fair, or poor. */
 function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
   const wrap = useRef(null)
@@ -3217,20 +3476,33 @@ function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
   const windowRef = useRef(null)
   const iriLayerRef = useRef(null)
   const poseRef = useRef({ km, pathMode })
+  const [showBuildings, setShowBuildings] = useState(false)
+  const [base, setBase] = useState('satellite')
+  const baseLayersRef = useRef(null)
   poseRef.current = { km, pathMode }
+  const here = latLngAtKm(km)
+  const roadGeo = useMemo(() => roadAnalysisGeo(iriRecords, pathMode), [iriRecords, pathMode])
+  const windowGeo = useMemo(() => windowAnalysisGeo(winStart, winEnd, pathMode), [winStart, winEnd, pathMode])
 
   useEffect(() => {
     const el = wrap.current
     if (!el) return undefined
     const m = L.map(el, { zoomControl: false, attributionControl: true, scrollWheelZoom: true })
-    L.tileLayer('https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+    const satellite = L.tileLayer('https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
       maxZoom: 20,
       subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
       attribution: '&copy; Google',
       keepBuffer: 4,
       updateWhenIdle: false,
       updateInterval: 80,
-    }).addTo(m)
+    })
+    const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      subdomains: ['a', 'b', 'c'],
+      attribution: '&copy; OpenStreetMap contributors',
+    })
+    baseLayersRef.current = { satellite, osm }
+    satellite.addTo(m)
     const here = latLngAtKm(km)
     markerRef.current = L.marker(here, {
       icon: hereArrowIcon(travelBearingDeg(km, pathMode)),
@@ -3257,10 +3529,40 @@ function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
       markerRef.current = null
       windowRef.current = null
       iriLayerRef.current = null
+      baseLayersRef.current = null
     }
     // Map is created once; chainage updates move the marker.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  useEffect(() => {
+    const m = mapRef.current
+    const layers = baseLayersRef.current
+    if (!m || !layers?.[base]) return
+    Object.values(layers).forEach((layer) => {
+      if (m.hasLayer(layer)) m.removeLayer(layer)
+    })
+    layers[base].addTo(m)
+    layers[base].bringToBack()
+  }, [base])
+
+  useEffect(() => {
+    if (showBuildings) return undefined
+    const m = mapRef.current
+    if (!m) return undefined
+    let cancelled = false
+    const refresh = () => {
+      if (cancelled || mapRef.current !== m) return
+      m.invalidateSize()
+    }
+    const raf = requestAnimationFrame(refresh)
+    const timer = setTimeout(refresh, 60)
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(raf)
+      clearTimeout(timer)
+    }
+  }, [showBuildings])
 
   useEffect(() => {
     const m = mapRef.current
@@ -3320,12 +3622,50 @@ function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
 
   return (
     <div className="relative h-full min-h-0 w-full overflow-hidden">
-      <div ref={wrap} className="absolute inset-0" />
+      <div ref={wrap} className={`absolute inset-0 ${showBuildings ? 'pointer-events-none' : ''}`} />
+      {showBuildings && (
+        <CorridorBuildingsMap
+          center={[here[1], here[0]]}
+          bearing={travelBearingDeg(km, pathMode)}
+          roadGeo={roadGeo}
+          windowGeo={windowGeo}
+          basemap={base}
+        />
+      )}
       <style>{'.nanasa-here-arrow{background:transparent!important;border:none!important;}'}</style>
-      <div className="pointer-events-none absolute bottom-2 left-2 z-[500] rounded-lg bg-black/75 px-2 py-1 text-[11px] font-semibold text-white shadow">
+      <div className="absolute left-2 top-2 z-[600] flex flex-col items-start gap-1">
+        <button
+          type="button"
+          onClick={() => setShowBuildings((on) => !on)}
+          className={`rounded-lg px-2.5 py-1 text-[12px] font-semibold shadow ${showBuildings ? 'bg-white text-slate-900' : 'bg-black/75 text-white'}`}
+        >
+          {showBuildings ? 'Flat map' : '3D buildings'}
+        </button>
+        <div className="flex overflow-hidden rounded-lg shadow">
+          {[
+            ['satellite', 'Satellite'],
+            ['osm', 'OSM'],
+          ].map(([id, label]) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => setBase(id)}
+              className={`px-2.5 py-1 text-[12px] font-semibold ${base === id ? 'bg-white text-slate-900' : 'bg-black/75 text-white hover:bg-black/85'}`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+      {showBuildings && (
+        <p className="pointer-events-none absolute bottom-2 right-12 z-[600] max-w-[220px] text-right text-[11px] font-semibold text-white [text-shadow:0_1px_2px_rgba(0,0,0,0.9)]">
+          Drag to rotate · Right-drag to tilt
+        </p>
+      )}
+      <div className="pointer-events-none absolute bottom-2 left-2 z-[600] rounded-lg bg-black/75 px-2 py-1 text-[11px] font-semibold text-white shadow">
         You are here · Ch {Number(km).toFixed(2)} km
       </div>
-      <div className="pointer-events-none absolute right-2 top-2 z-[500] flex items-center gap-2 rounded-lg bg-black/75 px-2 py-1 text-[11px] font-semibold text-white shadow">
+      <div className="pointer-events-none absolute right-2 top-2 z-[600] flex items-center gap-2 rounded-lg bg-black/75 px-2 py-1 text-[11px] font-semibold text-white shadow">
         {[
           ['good', 'Good'],
           ['fair', 'Fair'],
@@ -3519,6 +3859,14 @@ export default function NanasaRoad3DModal({
   const reportedRecords = useMemo(
     () => (reportedData.records || []).filter((r) => r.project_name === NANASA_PROJECT),
     [],
+  )
+  const reportedLatestDate = useMemo(() => {
+    const dates = reportedData.projects_dates?.[NANASA_PROJECT] || []
+    return [...dates].sort((a, b) => String(b).localeCompare(String(a)))[0] || ''
+  }, [])
+  const reportedOnRoad = useMemo(
+    () => reportedRecords.filter((r) => !reportedLatestDate || r.date === reportedLatestDate),
+    [reportedRecords, reportedLatestDate],
   )
   const predictedRecords = useMemo(() => {
     const dates = predictedData.projects_dates?.[NANASA_PROJECT] || []
@@ -3728,7 +4076,7 @@ export default function NanasaRoad3DModal({
       const side = gpsSideSign(r.latitude, r.longitude, origin, medianPts)
       return !side || side === want
     }
-    const reported = reportedRecords.filter(
+    const reported = reportedOnRoad.filter(
       (r) =>
         overlapsKm(r.chainage_start, r.chainage_end ?? r.chainage_start, winStart, winEnd) &&
         matchesDistress(r),
@@ -3798,7 +4146,7 @@ export default function NanasaRoad3DModal({
     scrubToChainage,
     corridor,
     pmsRecords,
-    reportedRecords,
+    reportedOnRoad,
     predictedAll,
     invPoints,
     invLines,
@@ -4134,6 +4482,14 @@ export default function NanasaRoad3DModal({
         )
       }
       controls.update()
+      const blinkLayers = runtime.current
+      if (blinkLayers) {
+        const fade = 0.72 + 0.22 * Math.sin(now * 0.0045)
+        const matsA = blinkLayers.reportedLayer?.userData?.blinkMats
+        const matsB = blinkLayers.predictedLayer?.userData?.blinkMats
+        if (matsA) for (let i = 0; i < matsA.length; i++) matsA[i].opacity = fade
+        if (matsB) for (let i = 0; i < matsB.length; i++) matsB[i].opacity = fade
+      }
       renderer.render(scene, camera)
       if (firstFrame) {
         firstFrame = false
@@ -4192,7 +4548,7 @@ export default function NanasaRoad3DModal({
       const pmrem = new THREE.PMREMGenerator(renderer)
       scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.06).texture
       pmrem.dispose()
-      const reportedLayer = addDistressLayer(root, reportedRecords, origin, points, 'reportedDistress', 1, true)
+      const reportedLayer = addDistressLayer(root, reportedOnRoad, origin, points, 'reportedDistress', 1, true)
       applyDistressFilter(reportedLayer, reportedFilterRef.current)
       if (runtime.current) runtime.current.reportedLayer = reportedLayer
       later(() => {
@@ -4251,7 +4607,7 @@ export default function NanasaRoad3DModal({
       cancelAnimationFrame(rafB)
       dispose?.()
     }
-  }, [open, corridor, invPoints, invLines, pmsRecords, reportedRecords, predictedRecords])
+  }, [open, corridor, invPoints, invLines, pmsRecords, reportedOnRoad, predictedRecords])
 
   useEffect(() => {
     if (!open || sceneLoading) return undefined
@@ -4289,7 +4645,7 @@ export default function NanasaRoad3DModal({
     const pool = here.length ? here : rows
     return pool.some((r) => String(r.pavement || '').toLowerCase() === 'concrete') ? 'Concrete' : 'Bituminous'
   })()
-  const ahead = upcomingDistress(reportedRecords, currentKm, pathMode, reportedFilter)
+  const ahead = upcomingDistress(reportedOnRoad, currentKm, pathMode, reportedFilter)
   const aheadRecord = ahead?.record
   const pathLabel =
     pathMode === 'lhs'
@@ -4710,6 +5066,22 @@ export default function NanasaRoad3DModal({
             </div>
           </div>
         )}
+        {!isMinimized && (
+          <button
+            type="button"
+            onClick={() => setShowDetails((on) => !on)}
+            aria-pressed={showDetails}
+            aria-label={showDetails ? 'Show charts' : 'View full information'}
+            title={showDetails ? 'Show charts' : 'Full information'}
+            className={`absolute bottom-12 right-3 z-20 inline-flex h-8 w-8 items-center justify-center rounded-full border shadow transition ${showDetails ? 'border-white bg-white text-slate-900' : 'border-white/30 bg-black/55 text-white hover:bg-black/70'}`}
+          >
+            <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden>
+              <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.7" />
+              <circle cx="12" cy="8" r="1.1" fill="currentColor" />
+              <path d="M12 11.2v5.3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+            </svg>
+          </button>
+        )}
         <div className="pointer-events-none absolute inset-0 z-10 flex flex-col justify-end p-1.5">
           <div className="pointer-events-auto flex h-7 w-full items-center gap-1.5 rounded-full border border-white/15 bg-[#0f172a] px-1.5 shadow-lg">
             <select
@@ -4792,7 +5164,7 @@ export default function NanasaRoad3DModal({
         </div>
         {!isMinimized && (
           <div className="flex min-h-0 w-[47%] min-w-0 flex-col border-l border-white/10 bg-[#0b1220]">
-            <div className="relative z-0 h-[42%] shrink-0 overflow-hidden">
+            <div className="relative z-0 h-[calc(42%+3rem)] shrink-0 overflow-hidden">
               <CorridorLocationMap
                 km={currentKm}
                 winStart={chainageSlice.winStart}
@@ -4803,22 +5175,6 @@ export default function NanasaRoad3DModal({
               {windowButtons}
             </div>
             <div className="flex min-h-0 flex-1 flex-col overflow-hidden border-t border-white/10">
-              <div className="flex shrink-0 items-center justify-end gap-3 px-3 py-2">
-                <button
-                  type="button"
-                  onClick={() => setShowDetails((on) => !on)}
-                  aria-pressed={showDetails}
-                  aria-label={showDetails ? 'Show charts' : 'View full information'}
-                  title={showDetails ? 'Show charts' : 'Full information'}
-                  className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full border transition ${showDetails ? 'border-white bg-white text-slate-900' : 'border-white/20 bg-white/10 text-white hover:bg-white/20'}`}
-                >
-                  <svg viewBox="0 0 24 24" className="h-4 w-4" aria-hidden>
-                    <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.7" />
-                    <circle cx="12" cy="8" r="1.1" fill="currentColor" />
-                    <path d="M12 11.2v5.3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-                  </svg>
-                </button>
-              </div>
               {showDetails ? (
               <div className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-hidden px-2 pb-2">
               {/* Pavement */}
@@ -5104,11 +5460,12 @@ export default function NanasaRoad3DModal({
                   ['Pavement', selectedReported.pavement_type || '—'],
                   ['Lane', selectedReported.lane || '—'],
                   ['Area', selectedReported.area != null ? `${Number(selectedReported.area).toFixed(2)} m²` : '—'],
+                  ['Percent', Number.isFinite(Number(selectedReported.percent)) ? `${Number(selectedReported.percent).toFixed(2)}%` : null],
                   ['Length', selectedReported.length != null ? `${Number(selectedReported.length).toFixed(2)} m` : '—'],
                   ['Width', selectedReported.width != null ? `${Number(selectedReported.width).toFixed(2)} m` : '—'],
                   ['Depth', selectedReported.depth != null ? `${Number(selectedReported.depth)}` : '—'],
                   ['Date', selectedReported.date || '—'],
-                ].map(([k, v]) => (
+                ].filter(([, v]) => v != null).map(([k, v]) => (
                   <div key={k} className="contents">
                     <dt className="text-slate-400">{k}</dt>
                     <dd className="m-0 font-medium text-slate-100">{v}</dd>
