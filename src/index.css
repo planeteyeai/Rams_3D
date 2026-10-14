@@ -51,11 +51,6 @@ button {
   to { opacity: 1; }
 }
 
-@keyframes live-dot {
-  0%, 100% { transform: scale(1); opacity: 1; }
-  50% { transform: scale(1.55); opacity: .45; }
-}
-
 .rise {
   animation: rise .5s cubic-bezier(.22, 1, .36, 1) both;
 }
@@ -84,10 +79,6 @@ button {
 
 .node-card.is-hot:hover .node-spot {
   opacity: 1;
-}
-
-.live-dot {
-  animation: live-dot 1.6s ease-in-out infinite;
 }
 
 .map-pin-wrap {
@@ -132,8 +123,7 @@ button {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .rise,
-  .live-dot {
+  .rise {
     animation: none;
   }
 

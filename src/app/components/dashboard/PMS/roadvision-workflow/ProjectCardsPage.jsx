@@ -69,16 +69,25 @@ const fullInventory = () => {
   return { total: types.reduce((n, t) => n + (t.n || 0), 0), types }
 }
 
-/** Inventory whose chainage overlaps the selected stretch of road. */
-function inventoryBetween(from, to) {
-  if (from <= ROAD_MIN + 0.001 && to >= ROAD_MAX - 0.001) return fullInventory()
+/** Increasing and Decreasing are carriageway sides (main and service). Both also keeps the median. */
+function matchesSide(dir, side) {
+  if (side === 'both') return true
+  const d = String(dir || '').toLowerCase()
+  return side === 'inc' ? d.startsWith('inc') : d.startsWith('dec')
+}
+
+/** Inventory whose chainage overlaps the selected stretch, on the selected side. */
+function inventoryBetween(from, to, side = 'both') {
+  if (side === 'both' && from <= ROAD_MIN + 0.001 && to >= ROAD_MAX - 0.001) return fullInventory()
   const tally = Object.fromEntries((invData.types || []).map((t) => [t.id, 0]))
   ;(invData.points || []).forEach((p) => {
+    if (!matchesSide(p.dir, side)) return
     const a = Number(p.start)
     const b = Number(p.end ?? p.start)
     if (b > from && a < to) tally[p.asset] = (tally[p.asset] || 0) + 1
   })
   ;(invData.lines || []).forEach((l) => {
+    if (!matchesSide(l.dir, side)) return
     const a = Number(l.start)
     const b = Number(l.end ?? l.start)
     const len = b - a
@@ -99,9 +108,9 @@ const DISTRESS_SIDES = [
 
 const DISTRESS_TYPES = ['Cracking', 'Raveling', 'Settlement', 'Pothole', 'Faulting', 'Bleeding']
 
-function distressBetween(from, to) {
-  const groups = DISTRESS_SIDES.map((side) => ({
-    ...side,
+function distressBetween(from, to, side = 'both') {
+  const groups = DISTRESS_SIDES.filter((g) => side === 'both' || g.dir === side).map((sideRow) => ({
+    ...sideRow,
     total: 0,
     types: Object.fromEntries(DISTRESS_TYPES.map((name) => [name, 0])),
   }))
@@ -110,8 +119,10 @@ function distressBetween(from, to) {
     const a = Number(r.chainage_start)
     const b = Number(r.chainage_end ?? r.chainage_start)
     if (!(b > from && a < to)) return
-    const service = String(r.road || '').toLowerCase() === 'service'
     const inc = String(r.direction || '').toLowerCase().startsWith('inc')
+    if (side === 'inc' && !inc) return
+    if (side === 'dec' && inc) return
+    const service = String(r.road || '').toLowerCase() === 'service'
     const id = service ? (inc ? 'sinc' : 'sdec') : (inc ? 'LHS' : 'RHS')
     const group = byId[id]
     if (!group) return
@@ -120,6 +131,36 @@ function distressBetween(from, to) {
     group.types[kind] = (group.types[kind] || 0) + 1
   })
   return groups
+}
+
+const SIDE_OPTIONS = [
+  { id: 'inc', label: 'Increasing' },
+  { id: 'dec', label: 'Decreasing' },
+  { id: 'both', label: 'Both' },
+]
+
+function SideSelect({ value, onChange }) {
+  return (
+    <div
+      className="flex shrink-0 rounded-full border border-indigo-100 bg-slate-50 p-0.5"
+      onClick={(e) => e.stopPropagation()}
+      onPointerDown={(e) => e.stopPropagation()}
+    >
+      {SIDE_OPTIONS.map((opt) => {
+        const on = value === opt.id
+        return (
+          <button
+            key={opt.id}
+            type="button"
+            onClick={() => onChange(opt.id)}
+            className={`rounded-full px-2.5 py-1 text-[12px] font-semibold ${on ? 'bg-indigo-600 text-white' : 'text-slate-500 hover:text-indigo-700'}`}
+          >
+            {opt.label}
+          </button>
+        )
+      })}
+    </div>
+  )
 }
 
 function RoadRangeBar({ from, to, onChange, holdOpen }) {
@@ -259,9 +300,10 @@ export default function ProjectCardsPage() {
   const [activeId, setActiveId] = useState(last)
   const [roadFrom, setRoadFrom] = useState(ROAD_MIN)
   const [roadTo, setRoadTo] = useState(ROAD_MAX)
+  const [side, setSide] = useState('both')
   const skipOpen = useRef(false)
-  const nanasaInventory = useMemo(() => inventoryBetween(roadFrom, roadTo), [roadFrom, roadTo])
-  const nanasaDistress = useMemo(() => distressBetween(roadFrom, roadTo), [roadFrom, roadTo])
+  const nanasaInventory = useMemo(() => inventoryBetween(roadFrom, roadTo, side), [roadFrom, roadTo, side])
+  const nanasaDistress = useMemo(() => distressBetween(roadFrom, roadTo, side), [roadFrom, roadTo, side])
   const list = useMemo(() => {
     const s = q.trim().toLowerCase()
     return s ? PROJECTS.filter((p) => `${p.name} ${p.subtitle} ${p.code} ${p.corridor} ${p.place}`.toLowerCase().includes(s)) : PROJECTS
@@ -327,7 +369,10 @@ export default function ProjectCardsPage() {
                         </p>
                       </div>
                       {detailed && (
-                        <RoadRangeBar from={roadFrom} to={roadTo} holdOpen={skipOpen} onChange={(a, b) => { setRoadFrom(a); setRoadTo(b) }} />
+                        <div className="flex min-w-0 flex-1 items-center gap-2">
+                          <RoadRangeBar from={roadFrom} to={roadTo} holdOpen={skipOpen} onChange={(a, b) => { setRoadFrom(a); setRoadTo(b) }} />
+                          <SideSelect value={side} onChange={setSide} />
+                        </div>
                       )}
                       <button
                         type="button"
@@ -348,7 +393,7 @@ export default function ProjectCardsPage() {
                       </div>
                     ) : null}
                     {detailed && (
-                      <div className="grid h-44 shrink-0 grid-cols-4 gap-1.5">
+                      <div className={`grid h-44 shrink-0 gap-1.5 ${nanasaDistress.length > 2 ? 'grid-cols-4' : 'grid-cols-2'}`}>
                         {nanasaDistress.map((g) => (
                           <div key={g.id} className="flex min-h-0 flex-col overflow-hidden rounded-lg border border-indigo-100 bg-white px-2 py-1.5">
                             <div className="flex items-baseline justify-between gap-1">

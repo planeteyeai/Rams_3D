@@ -631,6 +631,28 @@ function distressPatchSize(r) {
   }
 }
 
+/** A few slightly uneven outlines so distress patches are not identical rectangles. */
+function irregularPatchGeometry(seed) {
+  const shape = new THREE.Shape()
+  const steps = 8
+  const pts = []
+  for (let i = 0; i < steps; i++) {
+    const a = (i / steps) * Math.PI * 2
+    const wx = 0.9 + hash01(seed, i + 2) * 0.18
+    const wz = 0.88 + hash01(seed, i + 15) * 0.2
+    pts.push([Math.cos(a) * 0.5 * wx, Math.sin(a) * 0.5 * wz])
+  }
+  shape.moveTo(pts[0][0], pts[0][1])
+  for (let i = 1; i < pts.length; i++) shape.lineTo(pts[i][0], pts[i][1])
+  shape.closePath()
+  const geo = new THREE.ExtrudeGeometry(shape, { depth: 1, bevelEnabled: false })
+  geo.rotateX(-Math.PI / 2)
+  geo.translate(0, -0.5, 0)
+  return geo
+}
+
+const DISTRESS_PATCH_GEOS = [1, 2, 3, 4].map((seed) => irregularPatchGeometry(seed))
+
 /**
  * Reported = flat patches (length×width, warm severity colors).
  * Predicted = tall diamond markers (cool severity colors) so both layers read clearly together.
@@ -678,24 +700,32 @@ function addDistressLayer(root, records, origin, medianPts, name, scale = 1, asP
         polygonOffsetUnits: -2,
       })
       layer.userData.blinkMats.push(mat)
-      const mesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), mat, list.length)
-      mesh.renderOrder = 12
-      const pickRecords = []
+      const groups = DISTRESS_PATCH_GEOS.map(() => [])
       list.forEach((p, i) => {
-        const h = sev === 'High' ? 0.12 : sev === 'Medium' ? 0.09 : 0.07
-        dummy.position.set(p.x, h * 0.5 + PATCH_BASE_Y, p.z)
-        dummy.rotation.set(0, p.yaw || 0, 0)
-        dummy.scale.set(p.widthM, h, p.lengthM)
-        dummy.updateMatrix()
-        mesh.setMatrixAt(i, dummy.matrix)
-        pickRecords.push(p.record)
+        groups[Math.floor(hash01(i, 9) * groups.length)].push(p)
       })
-      mesh.instanceMatrix.needsUpdate = true
-      mesh.userData.severity = sev.toLowerCase()
-      mesh.userData.pickable = true
-      mesh.userData.records = pickRecords
-      mesh.receiveShadow = true
-      layer.add(mesh)
+      groups.forEach((group, vi) => {
+        if (!group.length) return
+        const mesh = new THREE.InstancedMesh(DISTRESS_PATCH_GEOS[vi], mat, group.length)
+        mesh.renderOrder = 12
+        const pickRecords = []
+        group.forEach((p, i) => {
+          const h = sev === 'High' ? 0.12 : sev === 'Medium' ? 0.09 : 0.07
+          const wobbleYaw = (hash01(i + vi * 17, 4) - 0.5) * 0.28
+          dummy.position.set(p.x, h * 0.5 + PATCH_BASE_Y, p.z)
+          dummy.rotation.set(0, (p.yaw || 0) + wobbleYaw, 0)
+          dummy.scale.set(p.widthM * (0.92 + hash01(i, 5) * 0.16), h, p.lengthM * (0.9 + hash01(i, 6) * 0.18))
+          dummy.updateMatrix()
+          mesh.setMatrixAt(i, dummy.matrix)
+          pickRecords.push(p.record)
+        })
+        mesh.instanceMatrix.needsUpdate = true
+        mesh.userData.severity = sev.toLowerCase()
+        mesh.userData.pickable = true
+        mesh.userData.records = pickRecords
+        mesh.receiveShadow = true
+        layer.add(mesh)
+      })
     })
     root.add(layer)
     return layer
@@ -1431,14 +1461,28 @@ function yawLabel(x, z, yaw, lx, y, lz, n) {
   return { x: x + lx * c + lz * s, z: z - lx * s + lz * c, y, yaw, n }
 }
 
+/**
+ * Main-road poles drawn with one arm are omitted. That includes survey rows
+ * labelled Double Arm when their direction is Increasing or Decreasing — those
+ * sit on the carriageway edge and render as a single arm. Median double-arm
+ * poles stay. Service-road lights are unchanged.
+ */
+function isMainRoadSingleArmLight(p) {
+  if (!/street light/i.test(String(p?.asset || ''))) return false
+  if (String(p?.road || '').toLowerCase() === 'service') return false
+  if (/single\s*arm/i.test(String(p?.sub || ''))) return true
+  return !String(p?.dir || '').toLowerCase().startsWith('med')
+}
+
 /** Highway cobra-head: single-arm on outer edges, double-arm on median. */
 function addStreetLights(root, list, origin, medianPts) {
-  if (!list?.length) return 0
+  const lights = (list || []).filter((p) => !isMainRoadSingleArmLight(p))
+  if (!lights.length) return 0
   const singles = []
   const doubles = []
   const labels = []
-  const nums = chainageNumbers(list)
-  list.forEach((p) => {
+  const nums = chainageNumbers(lights)
+  lights.forEach((p) => {
     const placed = placeStreetLight(p, origin, medianPts)
     if (placed.doubleArm) doubles.push(placed)
     else singles.push(placed)
@@ -1497,7 +1541,7 @@ function addStreetLights(root, list, origin, medianPts) {
     plate: 0x1c1408,
     tint: 0xffe08a,
   })
-  return list.length
+  return lights.length
 }
 
 function hash01(i, salt = 1) {
@@ -3665,7 +3709,7 @@ function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
       <div className="pointer-events-none absolute bottom-2 left-2 z-[600] rounded-lg bg-black/75 px-2 py-1 text-[11px] font-semibold text-white shadow">
         You are here · Ch {Number(km).toFixed(2)} km
       </div>
-      <div className="pointer-events-none absolute right-2 top-2 z-[600] flex items-center gap-2 rounded-lg bg-black/75 px-2 py-1 text-[11px] font-semibold text-white shadow">
+      <div className="pointer-events-none absolute right-2 top-12 z-[600] flex items-center gap-2 rounded-lg bg-black/75 px-2 py-1 text-[11px] font-semibold text-white shadow">
         {[
           ['good', 'Good'],
           ['fair', 'Fair'],
@@ -4088,6 +4132,7 @@ export default function NanasaRoad3DModal({
     )
     const invPts = invPoints.filter(
       (r) =>
+        !isMainRoadSingleArmLight(r) &&
         overlapsKm(r.start, r.end ?? r.start, winStart, winEnd) &&
         matchesPathDir(r.dir, pathMode) &&
         matchesPathRoad(r, pathMode),
@@ -4372,7 +4417,15 @@ export default function NanasaRoad3DModal({
     const controls = new OrbitControls(camera, renderer.domElement)
     controls.enableDamping = true
     controls.dampingFactor = 0.08
+    controls.zoomToCursor = true
     controls.maxPolarAngle = Math.PI * 0.49
+    const releaseFollow = () => {
+      if (!scrubRef.current.follow && !followRef.current) return
+      scrubRef.current.follow = false
+      followRef.current = false
+      setFollowScrubber(false)
+    }
+    controls.addEventListener('start', releaseFollow)
 
     const hemi = new THREE.HemisphereLight(0xeaf2ff, 0x4d5c42, 0.95)
     scene.add(hemi)
@@ -4481,6 +4534,9 @@ export default function NanasaRoad3DModal({
           Number.isFinite(sr._hlStart) && Number.isFinite(sr._hlEnd) ? (sr._hlStart + sr._hlEnd) / 2 : sr.chainageKm,
         )
       }
+      // Keep the eye and the orbit focus above the ground plane (pan and cursor-zoom can drag both under it).
+      if (camera.position.y < 0.4) camera.position.y = 0.4
+      if (controls.target.y < 0) controls.target.y = 0
       controls.update()
       const blinkLayers = runtime.current
       if (blinkLayers) {
@@ -4574,6 +4630,7 @@ export default function NanasaRoad3DModal({
       ro.disconnect()
       renderer.domElement.removeEventListener('pointerdown', onPointerDown)
       renderer.domElement.removeEventListener('pointerup', onPointerUp)
+      controls.removeEventListener('start', releaseFollow)
       controls.dispose()
       renderer.dispose()
       if (scene.environment) scene.environment.dispose()
@@ -4704,9 +4761,12 @@ export default function NanasaRoad3DModal({
     }
   }
 
-  /** Step along path by the selected window length. */
+  /** Step along path by the selected window length and look at that chainage again. */
   const stepScrub = (dir) => {
     setPlaying(false)
+    followRef.current = true
+    scrubRef.current.follow = true
+    setFollowScrubber(true)
     const span = (isServicePath(pathMode) ? servicePathLengthKm(pathMode) : CHAINAGE_MAX_KM - CHAINAGE_MIN_KM) || 1
     const delta = (windowLengthM / 1000 / span) * dir
     setScrubT((t) => Math.max(0, Math.min(1, t + delta)))
@@ -4973,7 +5033,12 @@ export default function NanasaRoad3DModal({
               <span className="text-[9px] font-semibold uppercase tracking-wide text-slate-100">Length</span>
               <select
                 value={windowLengthM}
-                onChange={(e) => setWindowLengthM(Number(e.target.value))}
+                onChange={(e) => {
+                  followRef.current = true
+                  scrubRef.current.follow = true
+                  setFollowScrubber(true)
+                  setWindowLengthM(Number(e.target.value))
+                }}
                 className="h-8 rounded-lg border border-white/50 bg-transparent px-1.5 text-[11px] font-semibold text-white outline-none hover:bg-white/10 [&>option]:bg-slate-900 [&>option]:text-white"
                 title="Chainage window length for cards"
                 aria-label="Chainage window length"
@@ -5081,6 +5146,43 @@ export default function NanasaRoad3DModal({
               <path d="M12 11.2v5.3" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
             </svg>
           </button>
+        )}
+        {selectedReported && (
+          <div className="pointer-events-auto absolute bottom-12 left-3 z-30 w-[min(280px,calc(100%-1.5rem))] overflow-hidden rounded-xl border border-white/15 bg-black/80 p-2.5 shadow-xl backdrop-blur">
+            <div className="mb-2 flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <p className="m-0 text-[10px] font-semibold uppercase tracking-wide text-slate-400">Reported distress</p>
+                <h3 className="m-0 truncate text-[15px] font-semibold text-white">{selectedReported.distress_type || 'Distress'}</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelectedReported(null)}
+                className="rounded-md px-1.5 py-0.5 text-[12px] text-slate-300 hover:bg-white/10 hover:text-white"
+                title="Close"
+              >
+                ✕
+              </button>
+            </div>
+            <dl className="m-0 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12px]">
+              {[
+                ['Chainage', `${selectedReported.chainage_start ?? '—'} – ${selectedReported.chainage_end ?? '—'} km`],
+                ['Direction', selectedReported.direction || '—'],
+                ['Pavement', selectedReported.pavement_type || '—'],
+                ['Lane', selectedReported.lane || '—'],
+                ['Area', selectedReported.area != null ? `${Number(selectedReported.area).toFixed(2)} m²` : '—'],
+                ['Percent', Number.isFinite(Number(selectedReported.percent)) ? `${Number(selectedReported.percent).toFixed(2)}%` : null],
+                ['Length', selectedReported.length != null ? `${Number(selectedReported.length).toFixed(2)} m` : '—'],
+                ['Width', selectedReported.width != null ? `${Number(selectedReported.width).toFixed(2)} m` : '—'],
+                ['Depth', selectedReported.depth != null ? `${Number(selectedReported.depth)}` : '—'],
+                ['Date', selectedReported.date || '—'],
+              ].filter(([, v]) => v != null).map(([k, v]) => (
+                <div key={k} className="contents">
+                  <dt className="text-slate-400">{k}</dt>
+                  <dd className="m-0 font-medium text-slate-100">{v}</dd>
+                </div>
+              ))}
+            </dl>
+          </div>
         )}
         <div className="pointer-events-none absolute inset-0 z-10 flex flex-col justify-end p-1.5">
           <div className="pointer-events-auto flex h-7 w-full items-center gap-1.5 rounded-full border border-white/15 bg-[#0f172a] px-1.5 shadow-lg">
@@ -5437,43 +5539,6 @@ export default function NanasaRoad3DModal({
                 </section>
               </div>
               )}
-          {selectedReported && (
-            <div className="pointer-events-auto mx-2 mb-2 shrink-0 overflow-hidden rounded-xl border border-white/15 bg-black/75 p-2 shadow-xl">
-              <div className="mb-2 flex items-start justify-between gap-2">
-                <div>
-                  <p className="m-0 text-[10px] font-semibold uppercase tracking-wide text-slate-400">Reported distress</p>
-                  <h3 className="m-0 text-[15px] font-semibold text-white">{selectedReported.distress_type || 'Distress'}</h3>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setSelectedReported(null)}
-                  className="rounded-md px-1.5 py-0.5 text-[12px] text-slate-300 hover:bg-white/10 hover:text-white"
-                  title="Close"
-                >
-                  ✕
-                </button>
-              </div>
-              <dl className="m-0 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12px]">
-                {[
-                  ['Chainage', `${selectedReported.chainage_start ?? '—'} – ${selectedReported.chainage_end ?? '—'} km`],
-                  ['Direction', selectedReported.direction || '—'],
-                  ['Pavement', selectedReported.pavement_type || '—'],
-                  ['Lane', selectedReported.lane || '—'],
-                  ['Area', selectedReported.area != null ? `${Number(selectedReported.area).toFixed(2)} m²` : '—'],
-                  ['Percent', Number.isFinite(Number(selectedReported.percent)) ? `${Number(selectedReported.percent).toFixed(2)}%` : null],
-                  ['Length', selectedReported.length != null ? `${Number(selectedReported.length).toFixed(2)} m` : '—'],
-                  ['Width', selectedReported.width != null ? `${Number(selectedReported.width).toFixed(2)} m` : '—'],
-                  ['Depth', selectedReported.depth != null ? `${Number(selectedReported.depth)}` : '—'],
-                  ['Date', selectedReported.date || '—'],
-                ].filter(([, v]) => v != null).map(([k, v]) => (
-                  <div key={k} className="contents">
-                    <dt className="text-slate-400">{k}</dt>
-                    <dd className="m-0 font-medium text-slate-100">{v}</dd>
-                  </div>
-                ))}
-              </dl>
-            </div>
-          )}
             </div>
           </div>
         )}

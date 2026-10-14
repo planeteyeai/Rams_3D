@@ -21,14 +21,8 @@ export default function App() {
             </span>
           </NavLink>
           <div className="flex items-center gap-3">
-            <span className="hidden items-center gap-1.5 rounded-full border border-indigo-100 bg-indigo-50 px-2.5 py-1 text-[11px] font-semibold text-indigo-600 sm:inline-flex">
-              <span className="live-dot h-1.5 w-1.5 rounded-full bg-indigo-500" />
-              Live workflow
-            </span>
             <nav className="flex items-end gap-1" aria-label="Temporary navigation">
               <NavLink to="/" className={() => tab(onWorkflow)}>Workflow</NavLink>
-              <NavLink to="/ris/reported" className={({ isActive }) => tab(isActive)}>Reported</NavLink>
-              <NavLink to="/ris/distress-prediction" className={({ isActive }) => tab(isActive)}>Predicted</NavLink>
             </nav>
           </div>
         </div>
