@@ -4994,6 +4994,14 @@ export default function NanasaRoad3DModal({
                     ? ` · Ch ${Number(aheadRecord.chainage_start).toFixed(2)}`
                     : ''}
                 </p>
+                {ahead.meters === 0 && aheadRecord.status && (
+                  <p className="m-0 mt-1 text-[22px] font-bold leading-tight text-amber-100">{aheadRecord.status}</p>
+                )}
+                {ahead.meters === 0 && Number.isFinite(Number(aheadRecord.percent)) && (
+                  <p className="m-0 mt-0.5 text-[22px] font-bold tabular-nums leading-tight text-amber-200">
+                    {Number(aheadRecord.percent).toFixed(2)}%
+                  </p>
+                )}
               </>
             )}
           </div>
