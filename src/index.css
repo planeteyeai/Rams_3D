@@ -2,13 +2,13 @@
 
 @theme {
   --font-sans: "Inter", "Segoe UI", system-ui, sans-serif;
-  --color-canvas: #f8f9ff;
-  --color-ink: #1e1b4b;
-  --color-soft: #6366f1;
-  --color-line: #4338ca;
-  --color-dot: #c7cbe8;
+  --color-canvas: #f4f6f8;
+  --color-ink: #0f1f3d;
+  --color-soft: #1d4ed8;
+  --color-line: #1e3a8a;
+  --color-dot: #d5dbe6;
   --color-ready: #22c55e;
-  --color-accent-blue: #3b82f6;
+  --color-accent-blue: #1d4ed8;
 }
 
 html,
@@ -35,11 +35,7 @@ body {
 }
 
 .dot-grid {
-  background-color: #f5f7ff;
-  background-image:
-    radial-gradient(circle at top, rgb(99 102 241 / .08), transparent 42%),
-    radial-gradient(#c7cbe8 1.1px, transparent 1.1px);
-  background-size: auto, 22px 22px;
+  background-color: #f4f6f8;
 }
 
 button {
@@ -92,18 +88,18 @@ button {
   width: 34px;
   height: 34px;
   border-radius: 999px;
-  background: #4f46e5;
+  background: #1d4ed8;
   color: #fff;
   font: 700 8px/1 Inter, sans-serif;
   letter-spacing: .04em;
-  box-shadow: 0 8px 16px rgb(67 56 202 / .35);
+  box-shadow: 0 8px 16px rgb(15 31 61 / .28);
   border: 2px solid #fff;
 }
 
 .map-pin.is-on {
   transform: scale(1.12);
-  background: #312e81;
-  box-shadow: 0 0 0 6px rgb(99 102 241 / .25), 0 10px 20px rgb(67 56 202 / .4);
+  background: #0f1f3d;
+  box-shadow: 0 0 0 6px rgb(29 78 216 / .22), 0 10px 20px rgb(15 31 61 / .35);
 }
 
 .map-pin.pin-blue { background: #2563eb; }
@@ -114,12 +110,50 @@ button {
 
 .leaflet-container {
   font-family: inherit;
-  background: #eef2ff;
+  background: #d9e2ec;
+}
+
+.leaflet-container img.leaflet-tile {
+  mix-blend-mode: normal !important;
 }
 
 .leaflet-top.leaflet-left {
   top: 10px;
   left: 10px;
+}
+
+.ch-tip {
+  background: #0f1f3d;
+  color: #fff;
+  border: 0;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font: 600 10px/1.2 Inter, sans-serif;
+  box-shadow: 0 4px 10px rgb(15 31 61 / .28);
+}
+
+.inv-marker {
+  cursor: pointer;
+}
+
+.ch-tip::before {
+  border-top-color: #0f1f3d !important;
+}
+
+.gis-control {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid rgb(15 31 61 / .12);
+  background: rgb(255 255 255 / .94);
+  color: #0f1f3d;
+  box-shadow: 0 1px 2px rgb(15 31 61 / .08);
+}
+
+.gis-control:hover {
+  background: #fff;
+  color: #1d4ed8;
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -1,5 +1,5 @@
 import { useEffect, useMemo } from 'react'
-import { Navigate, useNavigate, useOutletContext } from 'react-router-dom'
+import { Navigate, useNavigate, useOutletContext, useSearchParams } from 'react-router-dom'
 import WorkflowShell from './WorkflowShell'
 import NodeCard from './NodeCard'
 import { GraphLayout } from './ConnectorLayouts'
@@ -18,11 +18,25 @@ function colorOf(asset) {
 
 function NanasaDirect3D() {
   const nav = useNavigate()
+  const [params] = useSearchParams()
   const { setHideHeader } = useOutletContext()
   useEffect(() => {
     setHideHeader(true)
     return () => setHideHeader(false)
   }, [setHideHeader])
+
+  const entryChainageKm = (() => {
+    const n = Number(params.get('ch'))
+    return Number.isFinite(n) ? n : null
+  })()
+  const entrySide = params.get('side')
+  const entryPathMode = entrySide === 'inc' ? 'lhs' : entrySide === 'dec' ? 'rhs' : null
+  const entryAsset = (() => {
+    const raw = params.get('asset')
+    if (!raw) return null
+    return (invData.types || []).some((t) => t.id === raw) ? raw : null
+  })()
+  const entryKey = `${entryChainageKm ?? ''}|${entryPathMode ?? ''}|${entryAsset ?? ''}`
 
   const date = invData.dates?.[0] || ''
   const inventoryPoints = useMemo(() => invData.points.filter((r) => {
@@ -61,6 +75,10 @@ function NanasaDirect3D() {
         inventoryLines={inventoryLines}
         pavementRecords={pavementRecords}
         pavementDate={pmsData.dates?.[0] || ''}
+        initialChainageKm={entryChainageKm}
+        initialPathMode={entryPathMode}
+        initialMapAsset={entryAsset}
+        entryKey={entryKey}
       />
     </div>
   )

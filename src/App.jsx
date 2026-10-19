@@ -1,35 +1,31 @@
 import { useState } from 'react'
-import { NavLink, Outlet, useLocation } from 'react-router-dom'
-
-const tab = (on) => `relative rounded-lg px-3 py-2 text-sm font-medium no-underline transition ${on ? 'text-indigo-950 after:absolute after:inset-x-2 after:bottom-0 after:h-1 after:rounded-full after:bg-indigo-600' : 'text-slate-500 hover:bg-indigo-50 hover:text-indigo-800'}`
+import { NavLink, Outlet } from 'react-router-dom'
 
 export default function App() {
-  const { pathname } = useLocation()
-  const onWorkflow = pathname === '/' || pathname.startsWith('/workflow')
   const [hideHeader, setHideHeader] = useState(false)
+  const [projectQuery, setProjectQuery] = useState('')
 
   return (
-    <div className="flex h-svh max-h-svh flex-col overflow-hidden bg-canvas text-ink">
+    <div className="flex h-svh max-h-svh flex-col overflow-hidden bg-[#f1f3f6] text-[#0b1424]">
       {!hideHeader && (
-      <header className="z-20 shrink-0 border-b border-indigo-100 bg-white/95 backdrop-blur">
-        <div className="mx-auto flex h-14 w-[min(1280px,calc(100%-2rem))] items-center justify-between gap-4">
-          <NavLink to="/" className="group flex items-center gap-2.5 text-indigo-950 no-underline">
-            <span className="grid h-8 w-8 place-items-center rounded-xl bg-indigo-600 text-[11px] font-bold text-white shadow-sm transition group-hover:scale-105 group-hover:bg-indigo-500">NR</span>
-            <span className="flex flex-col">
-              <strong className="text-[13px] tracking-[0.08em] uppercase">NHIT RAMS</strong>
-              <span className="text-[11px] font-normal text-slate-500">Road Asset Management · RoadVision workflow</span>
-            </span>
-          </NavLink>
-          <div className="flex items-center gap-3">
-            <nav className="flex items-end gap-1" aria-label="Temporary navigation">
-              <NavLink to="/" className={() => tab(onWorkflow)}>Workflow</NavLink>
-            </nav>
+        <header className="z-30 shrink-0 border-b border-[#e2e8f0] bg-white">
+          <div className="flex h-12 w-full items-center gap-4 px-4 lg:px-5">
+            <NavLink to="/" className="group flex min-w-0 shrink-0 items-center gap-2.5 text-[#0b1424] no-underline">
+              <span className="grid h-8 w-8 place-items-center rounded-md bg-[#0b1424] text-[10px] font-bold tracking-[0.08em] text-white">
+                NR
+              </span>
+              <span className="flex min-w-0 flex-col leading-none">
+                <strong className="text-[14px] font-semibold tracking-[0.04em]">NHIT RAMS</strong>
+                <span className="mt-0.5 hidden truncate text-[11px] font-medium text-slate-500 sm:block">
+                  Road Asset Management · RoadVision Workflow
+                </span>
+              </span>
+            </NavLink>
           </div>
-        </div>
-      </header>
+        </header>
       )}
-      <main className="dot-grid flex min-h-0 flex-1 flex-col overflow-hidden">
-        <Outlet context={{ setHideHeader }} />
+      <main className="flex min-h-0 flex-1 flex-col overflow-hidden bg-[#f1f3f6]">
+        <Outlet context={{ setHideHeader, projectQuery, setProjectQuery }} />
       </main>
     </div>
   )

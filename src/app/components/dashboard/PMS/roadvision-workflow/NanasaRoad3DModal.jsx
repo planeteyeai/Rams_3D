@@ -9,6 +9,7 @@ import RoadAadtBadge from './RoadAadtBadge'
 import reportedData from '../../../../../assets/data/adani-reported.json'
 import predictedData from '../../../../../assets/data/adani-predicted.json'
 import pmsData from '../../../../../assets/data/adani-pms.json'
+import invData from '../../../../../assets/data/adani-inventory.json'
 import serviceRoadData from '../../../../../assets/data/nanasa-service-roads.json'
 import {
   buildDashedRibbon,
@@ -1339,12 +1340,15 @@ function roadFacingYaw(medianPts, x, z, dir) {
   return dec ? Math.atan2(f.tx, f.tz) : Math.atan2(-f.tx, -f.tz)
 }
 
+/** Glyph atlas: 0–9 then `/` so plates can show `22/100`. */
+const NUMBER_GLYPHS = 11
+const NUMBER_SLASH = 10
 let numberDigitAtlasTex = null
 function numberDigitAtlas() {
   if (numberDigitAtlasTex) return numberDigitAtlasTex
   const cell = 64
   const c = document.createElement('canvas')
-  c.width = cell * 10
+  c.width = cell * NUMBER_GLYPHS
   c.height = cell
   const g = c.getContext('2d')
   g.clearRect(0, 0, c.width, c.height)
@@ -1353,6 +1357,8 @@ function numberDigitAtlas() {
   g.textBaseline = 'middle'
   g.fillStyle = '#ffffff'
   for (let d = 0; d < 10; d++) g.fillText(String(d), d * cell + cell / 2, cell / 2 + 2)
+  g.font = '700 48px Segoe UI, Arial, sans-serif'
+  g.fillText('/', NUMBER_SLASH * cell + cell / 2, cell / 2 + 1)
   const tex = new THREE.CanvasTexture(c)
   tex.colorSpace = THREE.SRGBColorSpace
   tex.magFilter = THREE.LinearFilter
@@ -1362,40 +1368,58 @@ function numberDigitAtlas() {
   return tex
 }
 
+function numberLabelText(lb, opt = {}) {
+  const n = Number(lb?.n)
+  if (!Number.isFinite(n) || n <= 0) return ''
+  const total = Number(lb?.total ?? opt.total)
+  if (Number.isFinite(total) && total > 0) return `${n}/${total}`
+  return String(n)
+}
+
+function glyphIndex(ch) {
+  if (ch === '/') return NUMBER_SLASH
+  const d = ch.charCodeAt(0) - 48
+  return d >= 0 && d <= 9 ? d : -1
+}
+
 /**
  * Small number plate on each asset, drawn on both faces so it reads while orbiting.
- * `n` is the chainage sequence for that asset type.
+ * `n` is the chainage sequence for that asset type; with `total` it shows `n/total`.
  */
 function addNumberLabels(root, labels, opt = {}) {
-  const digitW = opt.digitW ?? 0.24
-  const digitH = opt.digitH ?? 0.38
+  const digitW = opt.digitW ?? 0.2
+  const digitH = opt.digitH ?? 0.34
   const liftZ = opt.liftZ ?? 0.14
-  const usable = (labels || []).filter((lb) => Number.isFinite(lb.n) && lb.n > 0)
+  const usable = (labels || [])
+    .map((lb) => ({ ...lb, text: numberLabelText(lb, opt) }))
+    .filter((lb) => lb.text)
   if (!usable.length) return
 
-  const buckets = Array.from({ length: 10 }, () => [])
+  const buckets = Array.from({ length: NUMBER_GLYPHS }, () => [])
   const plates = []
   usable.forEach((lb) => {
-    const text = String(lb.n)
+    const text = lb.text
     const len = text.length
+    const gap = digitW * 0.92
     for (const yaw of [lb.yaw || 0, (lb.yaw || 0) + Math.PI]) {
       plates.push({
         x: lb.x,
         z: lb.z,
         y: lb.y,
         yaw,
-        w: len * digitW + digitW * 0.5,
+        w: len * gap + digitW * 0.55,
         h: digitH * 1.28,
       })
       for (let s = 0; s < len; s++) {
-        const d = text.charCodeAt(s) - 48
-        if (d < 0 || d > 9) continue
+        const d = glyphIndex(text[s])
+        if (d < 0) continue
         buckets[d].push({
           x: lb.x,
           z: lb.z,
           y: lb.y,
           yaw,
-          ox: (s - (len - 1) / 2) * digitW,
+          ox: (s - (len - 1) / 2) * gap,
+          slim: d === NUMBER_SLASH,
         })
       }
     }
@@ -1427,11 +1451,12 @@ function addNumberLabels(root, labels, opt = {}) {
   root.add(plate)
 
   const atlas = numberDigitAtlas()
+  const cell = 1 / NUMBER_GLYPHS
   buckets.forEach((list, d) => {
     if (!list.length) return
     const map = atlas.clone()
-    map.repeat.set(0.1, 1)
-    map.offset.set(d * 0.1, 0)
+    map.repeat.set(cell, 1)
+    map.offset.set(d * cell, 0)
     const mesh = new THREE.InstancedMesh(
       new THREE.PlaneGeometry(digitW, digitH),
       new THREE.MeshBasicMaterial({
@@ -1447,7 +1472,7 @@ function addNumberLabels(root, labels, opt = {}) {
       }),
       list.length,
     )
-    list.forEach((p, i) => place(mesh, i, p, p.ox, p.y, liftZ + 0.025, 1, 1))
+    list.forEach((p, i) => place(mesh, i, p, p.ox, p.y, liftZ + 0.025, p.slim ? 0.7 : 1, 1))
     mesh.instanceMatrix.needsUpdate = true
     mesh.frustumCulled = false
     root.add(mesh)
@@ -1476,12 +1501,15 @@ function isMainRoadSingleArmLight(p) {
 
 /** Highway cobra-head: single-arm on outer edges, double-arm on median. */
 function addStreetLights(root, list, origin, medianPts) {
-  const lights = (list || []).filter((p) => !isMainRoadSingleArmLight(p))
+  const all = list || []
+  // Numbers and totals match the inventory card (all street lights).
+  // Main-road single-arm poles are still not drawn.
+  const nums = chainageNumbers(all)
+  const lights = all.filter((p) => !isMainRoadSingleArmLight(p))
   if (!lights.length) return 0
   const singles = []
   const doubles = []
   const labels = []
-  const nums = chainageNumbers(lights)
   lights.forEach((p) => {
     const placed = placeStreetLight(p, origin, medianPts)
     if (placed.doubleArm) doubles.push(placed)
@@ -1535,11 +1563,12 @@ function addStreetLights(root, list, origin, medianPts) {
   }
 
   addNumberLabels(root, labels, {
-    digitW: 0.32,
-    digitH: 0.5,
+    digitW: 0.22,
+    digitH: 0.36,
     liftZ: 0.18,
     plate: 0x1c1408,
     tint: 0xffe08a,
+    total: all.length,
   })
   return lights.length
 }
@@ -1658,11 +1687,12 @@ function addTrees(root, list, origin, medianPts) {
     root.add(part.mesh)
   })
   addNumberLabels(root, treeLabels, {
-    digitW: 0.22,
-    digitH: 0.36,
+    digitW: 0.18,
+    digitH: 0.3,
     liftZ: 0.32,
     plate: 0x14210f,
     tint: 0xffffff,
+    total: list.length,
   })
   return count
 }
@@ -1801,6 +1831,24 @@ function addTollPlazas(root, list, origin, medianPts) {
     })
     root.add(g)
   })
+  const tollNums = chainageNumbers(list)
+  addNumberLabels(
+    root,
+    plazas.map((p) => {
+      const loc = lngLatToLocal(p.lng, p.lat, origin)
+      const f = medianPts?.length
+        ? recordFrame(medianPts, p.start, p.end, loc)
+        : { x: loc.x, z: loc.z, nx: 0, nz: 1 }
+      return {
+        x: f.x,
+        z: f.z,
+        y: 7.6,
+        yaw: Math.atan2(f.nx, f.nz),
+        n: tollNums.get(p.i),
+      }
+    }),
+    { digitW: 0.28, digitH: 0.42, liftZ: 0.2, plate: 0x0d47a1, tint: 0xffe082, total: list.length },
+  )
   return plazas.length
 }
 
@@ -1912,6 +1960,26 @@ function addFuelStations(root, list, origin, medianPts) {
     })
     root.add(g)
   })
+  const fuelNums = chainageNumbers(list)
+  const fuelOffset = LIGHT_SHOULDER_M + 9.5
+  addNumberLabels(
+    root,
+    stations.map((p) => {
+      const loc = lngLatToLocal(p.lng, p.lat, origin)
+      const f = medianPts?.length
+        ? recordFrame(medianPts, p.start, p.end, loc)
+        : { x: loc.x, z: loc.z, nx: 1, nz: 0 }
+      const sign = dirSideSign(p.dir)
+      return {
+        x: f.x + f.nx * fuelOffset * sign,
+        z: f.z + f.nz * fuelOffset * sign,
+        y: 5.6,
+        yaw: Math.atan2(-f.nx * sign, -f.nz * sign),
+        n: fuelNums.get(p.i),
+      }
+    }),
+    { digitW: 0.22, digitH: 0.34, liftZ: 0.16, plate: 0x0d47a1, tint: 0xffe082, total: list.length },
+  )
   return stations.length
 }
 
@@ -1982,6 +2050,46 @@ function addInstancedKit(root, placements, specs) {
   })
 }
 
+/** Plate height per asset so labels sit above the mesh, not through it. */
+function furnitureLabelY(asset) {
+  if (asset === 'Sign Boards') return 2.85
+  if (asset === 'Hazard Markers') return 2.15
+  if (asset === 'KM Stones') return 1.2
+  if (asset === 'Delineators') return 1.4
+  if (asset === 'Culvert') return 1.5
+  if (asset === 'Bus Shelters') return 2.9
+  if (asset === 'Bus Bays') return 2.7
+  if (asset === 'Truck Layby') return 1.1
+  if (asset === 'Solar Blinker') return 3.0
+  if (asset === 'Pedestrian Guard Rail') return 1.35
+  return 1.2
+}
+
+/** Inventory card total for this asset type — same denominator as the landing counts. */
+function addInventoryCountLabels(root, list, placements, opt = {}) {
+  if (!list?.length || !placements?.length) return
+  const nums = opt.nums || chainageNumbers(list)
+  const y = opt.y ?? 2.2
+  addNumberLabels(
+    root,
+    placements.map((pl, i) => ({
+      x: pl.x,
+      z: pl.z,
+      y: pl.labelY ?? y,
+      yaw: pl.yaw || 0,
+      n: nums.get(list[i].i),
+    })),
+    {
+      digitW: opt.digitW ?? 0.16,
+      digitH: opt.digitH ?? 0.28,
+      liftZ: opt.liftZ ?? 0.12,
+      plate: opt.plate ?? 0x12151c,
+      tint: opt.tint ?? 0xffffff,
+      total: opt.total ?? list.length,
+    },
+  )
+}
+
 function addRoadFurniture(root, list, asset, origin, medianPts, signNums) {
   const placements = list.map((p) => placeOnCorridor(p, origin, medianPts))
   const steel = new THREE.MeshStandardMaterial({ color: 0x5b6570, metalness: 0.55, roughness: 0.35 })
@@ -1995,19 +2103,21 @@ function addRoadFurniture(root, list, asset, origin, medianPts, signNums) {
   const roof = new THREE.MeshStandardMaterial({ color: 0x37474f, metalness: 0.4, roughness: 0.4 })
 
   if (asset === 'Sign Boards') {
-    const placements = list.map((p) => placeSignBoard(p, origin, medianPts))
-    addInstancedKit(root, placements, [
+    const boardPlacements = list.map((p) => placeSignBoard(p, origin, medianPts))
+    addInstancedKit(root, boardPlacements, [
       { geo: new THREE.CylinderGeometry(0.045, 0.055, 2.7, 8), mat: steel, oy: 1.35 },
       { geo: new THREE.BoxGeometry(1.15, 0.95, 0.06), mat: green, oy: 2.85, oz: 0.04 },
       { geo: new THREE.BoxGeometry(0.95, 0.72, 0.03), mat: white, oy: 2.85, oz: 0.08 },
     ])
-    if (signNums) {
-      addNumberLabels(
-        root,
-        placements.map((pl, i) => ({ x: pl.x, z: pl.z, y: 2.85, yaw: pl.yaw || 0, n: signNums.get(list[i].i) })),
-        { digitW: 0.2, digitH: 0.34, liftZ: 0.13, plate: 0x0c3d22, tint: 0xffffff },
-      )
-    }
+    addInventoryCountLabels(root, list, boardPlacements, {
+      nums: signNums,
+      total: signNums?.size || list.length,
+      y: 2.85,
+      digitW: 0.16,
+      digitH: 0.28,
+      liftZ: 0.13,
+      plate: 0x0c3d22,
+    })
     return list.length
   }
   if (asset === 'Hazard Markers') {
@@ -2016,31 +2126,23 @@ function addRoadFurniture(root, list, asset, origin, medianPts, signNums) {
       { geo: new THREE.BoxGeometry(0.7, 0.7, 0.07), mat: orange, oy: 1.85, oz: 0.04, rz: Math.PI / 4 },
       { geo: new THREE.BoxGeometry(0.22, 0.55, 0.04), mat: black, oy: 1.85, oz: 0.08 },
     ])
-    return list.length
-  }
-  if (asset === 'KM Stones') {
+  } else if (asset === 'KM Stones') {
     addInstancedKit(root, placements, [
       { geo: new THREE.BoxGeometry(0.42, 0.95, 0.28), mat: yellow, oy: 0.48 },
       { geo: new THREE.BoxGeometry(0.38, 0.28, 0.08), mat: black, oy: 0.72, oz: 0.12 },
       { geo: new THREE.BoxGeometry(0.5, 0.08, 0.36), mat: conc, oy: 0.04 },
     ])
-    return list.length
-  }
-  if (asset === 'Delineators') {
+  } else if (asset === 'Delineators') {
     addInstancedKit(root, placements, [
       { geo: new THREE.CylinderGeometry(0.035, 0.04, 1.15, 8), mat: steel, oy: 0.58 },
       { geo: new THREE.BoxGeometry(0.12, 0.22, 0.05), mat: yellow, oy: 1.12, oz: 0.02 },
     ])
-    return list.length
-  }
-  if (asset === 'Culvert') {
+  } else if (asset === 'Culvert') {
     addInstancedKit(root, placements, [
       { geo: new THREE.BoxGeometry(3.4, 1.15, 2.2), mat: conc, oy: 0.4 },
       { geo: new THREE.BoxGeometry(2.2, 0.55, 0.2), mat: black, oy: 0.38, oz: 1.05 },
     ])
-    return list.length
-  }
-  if (asset === 'Bus Shelters') {
+  } else if (asset === 'Bus Shelters') {
     addInstancedKit(root, placements, [
       { geo: new THREE.BoxGeometry(4.4, 0.12, 2.2), mat: roof, oy: 2.55 },
       { geo: new THREE.CylinderGeometry(0.06, 0.06, 2.5, 8), mat: steel, ox: -1.9, oy: 1.25, oz: -0.85 },
@@ -2050,24 +2152,18 @@ function addRoadFurniture(root, list, asset, origin, medianPts, signNums) {
       { geo: new THREE.BoxGeometry(4.0, 1.1, 0.06), mat: glass, oy: 1.5, oz: -1.05 },
       { geo: new THREE.BoxGeometry(3.6, 0.08, 0.45), mat: steel, oy: 0.48 },
     ])
-    return list.length
-  }
-  if (asset === 'Bus Bays') {
+  } else if (asset === 'Bus Bays') {
     addInstancedKit(root, placements, [
       { geo: new THREE.BoxGeometry(12, 0.08, 3.2), mat: new THREE.MeshStandardMaterial({ color: 0x3a3f46, roughness: 0.95 }), oy: 0.04 },
       { geo: new THREE.BoxGeometry(12, 0.03, 0.18), mat: yellow, oy: 0.09, oz: 1.5 },
       { geo: new THREE.BoxGeometry(3.8, 0.1, 1.8), mat: roof, oy: 2.4, oz: -0.4 },
     ])
-    return list.length
-  }
-  if (asset === 'Truck Layby') {
+  } else if (asset === 'Truck Layby') {
     addInstancedKit(root, placements, [
       { geo: new THREE.BoxGeometry(18, 0.08, 5.5), mat: new THREE.MeshStandardMaterial({ color: 0x3a3f46, roughness: 0.95 }), oy: 0.04 },
       { geo: new THREE.BoxGeometry(18, 0.03, 0.2), mat: yellow, oy: 0.09, oz: 2.6 },
     ])
-    return list.length
-  }
-  if (asset === 'Solar Blinker') {
+  } else if (asset === 'Solar Blinker') {
     const amber = new THREE.MeshStandardMaterial({ color: 0xffb300, emissive: 0xff8f00, emissiveIntensity: 1.2, roughness: 0.3 })
     const panel = new THREE.MeshStandardMaterial({ color: 0x1a237e, roughness: 0.25, metalness: 0.5 })
     addInstancedKit(root, placements, [
@@ -2075,9 +2171,7 @@ function addRoadFurniture(root, list, asset, origin, medianPts, signNums) {
       { geo: new THREE.CylinderGeometry(0.16, 0.16, 0.12, 12), mat: amber, oy: 2.45, oz: 0.08, rx: Math.PI / 2 },
       { geo: new THREE.BoxGeometry(0.45, 0.03, 0.35), mat: panel, oy: 2.75, rx: -0.4 },
     ])
-    return list.length
-  }
-  if (asset === 'Pedestrian Guard Rail') {
+  } else if (asset === 'Pedestrian Guard Rail') {
     addInstancedKit(root, placements, [
       { geo: new THREE.BoxGeometry(6, 0.06, 0.06), mat: yellow, oy: 1.0 },
       { geo: new THREE.BoxGeometry(6, 0.05, 0.05), mat: black, oy: 0.55 },
@@ -2085,11 +2179,12 @@ function addRoadFurniture(root, list, asset, origin, medianPts, signNums) {
       { geo: new THREE.BoxGeometry(0.06, 1.05, 0.06), mat: steel, oy: 0.52 },
       { geo: new THREE.BoxGeometry(0.06, 1.05, 0.06), mat: steel, ox: 2.9, oy: 0.52 },
     ])
-    return list.length
+  } else {
+    addInstancedKit(root, placements, [
+      { geo: new THREE.CylinderGeometry(0.22, 0.28, 0.7, 10), mat: conc, oy: 0.35 },
+    ])
   }
-  addInstancedKit(root, placements, [
-    { geo: new THREE.CylinderGeometry(0.22, 0.28, 0.7, 10), mat: conc, oy: 0.35 },
-  ])
+  addInventoryCountLabels(root, list, placements, { y: furnitureLabelY(asset) })
   return list.length
 }
 
@@ -2322,7 +2417,7 @@ function addMedianPlants(root, list, origin, medianPts) {
         n: medianNums.get(p.i),
       }
     }),
-    { digitW: 0.2, digitH: 0.32, liftZ: 0.12, plate: 0x163018, tint: 0xd8ffc4 },
+    { digitW: 0.16, digitH: 0.28, liftZ: 0.12, plate: 0x163018, tint: 0xd8ffc4, total: list.length },
   )
   return list.length
 }
@@ -2515,11 +2610,12 @@ function addGantrySigns(root, list, medianPts, signNums) {
     }
   })
   addNumberLabels(root, gantryLabels, {
-    digitW: 0.36,
-    digitH: 0.55,
+    digitW: 0.24,
+    digitH: 0.4,
     liftZ: 0.42,
     plate: 0x08301c,
     tint: 0xffffff,
+    total: signNums?.size || list.length,
   })
   return list.length
 }
@@ -2674,11 +2770,12 @@ function addCantileverSigns(root, list, medianPts, signNums) {
     }
   })
   addNumberLabels(root, cantileverLabels, {
-    digitW: 0.34,
-    digitH: 0.5,
+    digitW: 0.22,
+    digitH: 0.36,
     liftZ: 0.3,
     plate: 0x08301c,
     tint: 0xffffff,
+    total: signNums?.size || list.length,
   })
   return list.length
 }
@@ -2780,7 +2877,7 @@ function addMandatorySigns(root, list, origin, medianPts, signNums) {
     addNumberLabels(
       root,
       placements.map((pl, i) => ({ x: pl.x, z: pl.z, y: postH + 0.05, yaw: pl.yaw || 0, n: signNums.get(list[i].i) })),
-      { digitW: 0.15, digitH: 0.24, liftZ: 0.1, plate: 0x3a0a0a, tint: 0xffffff },
+      { digitW: 0.12, digitH: 0.2, liftZ: 0.1, plate: 0x3a0a0a, tint: 0xffffff, total: signNums.size },
     )
   }
   return list.length
@@ -3512,26 +3609,30 @@ function windowAnalysisGeo(winStart, winEnd, pathMode) {
   return { type: 'FeatureCollection', features }
 }
 
-/** Small map of the corridor. The road is coloured by IRI: good, fair, or poor. */
-function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
+/** Fresh Leaflet map. Remounted whenever the user returns from the 3D buildings view. */
+function FlatCorridorMap({ km, winStart, winEnd, iriRecords, pathMode, base, mapAsset, inventoryPoints, inventoryLines, onPickAsset }) {
   const wrap = useRef(null)
   const mapRef = useRef(null)
   const markerRef = useRef(null)
   const windowRef = useRef(null)
   const iriLayerRef = useRef(null)
+  const assetLayerRef = useRef(null)
   const poseRef = useRef({ km, pathMode })
-  const [showBuildings, setShowBuildings] = useState(false)
-  const [base, setBase] = useState('satellite')
   const baseLayersRef = useRef(null)
+  const onPickRef = useRef(onPickAsset)
   poseRef.current = { km, pathMode }
-  const here = latLngAtKm(km)
-  const roadGeo = useMemo(() => roadAnalysisGeo(iriRecords, pathMode), [iriRecords, pathMode])
-  const windowGeo = useMemo(() => windowAnalysisGeo(winStart, winEnd, pathMode), [winStart, winEnd, pathMode])
+  onPickRef.current = onPickAsset
 
   useEffect(() => {
     const el = wrap.current
     if (!el) return undefined
-    const m = L.map(el, { zoomControl: false, attributionControl: true, scrollWheelZoom: true })
+    const m = L.map(el, {
+      zoomControl: false,
+      attributionControl: true,
+      scrollWheelZoom: true,
+      fadeAnimation: false,
+      zoomAnimation: false,
+    })
     const satellite = L.tileLayer('https://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
       maxZoom: 20,
       subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
@@ -3546,7 +3647,7 @@ function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
       attribution: '&copy; OpenStreetMap contributors',
     })
     baseLayersRef.current = { satellite, osm }
-    satellite.addTo(m)
+    ;(baseLayersRef.current[base] || satellite).addTo(m)
     const here = latLngAtKm(km)
     markerRef.current = L.marker(here, {
       icon: hereArrowIcon(travelBearingDeg(km, pathMode)),
@@ -3555,6 +3656,7 @@ function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
       zIndexOffset: 800,
     }).addTo(m)
     m.setView(here, 14)
+    assetLayerRef.current = L.featureGroup().addTo(m)
     mapRef.current = m
     const onZoom = () => {
       const pose = poseRef.current
@@ -3563,9 +3665,11 @@ function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
     m.on('zoomend', onZoom)
     const ro = new ResizeObserver(() => m.invalidateSize())
     ro.observe(el)
-    const t = setTimeout(() => m.invalidateSize(), 150)
+    const t1 = setTimeout(() => m.invalidateSize(), 50)
+    const t2 = setTimeout(() => m.invalidateSize(), 250)
     return () => {
-      clearTimeout(t)
+      clearTimeout(t1)
+      clearTimeout(t2)
       ro.disconnect()
       m.off('zoomend', onZoom)
       m.remove()
@@ -3573,9 +3677,10 @@ function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
       markerRef.current = null
       windowRef.current = null
       iriLayerRef.current = null
+      assetLayerRef.current = null
       baseLayersRef.current = null
     }
-    // Map is created once; chainage updates move the marker.
+    // Created once per mount. Chainage and basemap updates are separate effects.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -3583,30 +3688,14 @@ function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
     const m = mapRef.current
     const layers = baseLayersRef.current
     if (!m || !layers?.[base]) return
-    Object.values(layers).forEach((layer) => {
-      if (m.hasLayer(layer)) m.removeLayer(layer)
+    Object.entries(layers).forEach(([id, layer]) => {
+      const want = id === base
+      const has = m.hasLayer(layer)
+      if (want && !has) layer.addTo(m)
+      if (!want && has) m.removeLayer(layer)
     })
-    layers[base].addTo(m)
     layers[base].bringToBack()
   }, [base])
-
-  useEffect(() => {
-    if (showBuildings) return undefined
-    const m = mapRef.current
-    if (!m) return undefined
-    let cancelled = false
-    const refresh = () => {
-      if (cancelled || mapRef.current !== m) return
-      m.invalidateSize()
-    }
-    const raf = requestAnimationFrame(refresh)
-    const timer = setTimeout(refresh, 60)
-    return () => {
-      cancelled = true
-      cancelAnimationFrame(raf)
-      clearTimeout(timer)
-    }
-  }, [showBuildings])
 
   useEffect(() => {
     const m = mapRef.current
@@ -3634,7 +3723,7 @@ function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
       }).filter(Boolean)
     }
     prefetchCorridorTiles(m, km, pathMode)
-    m.panTo(here, { animate: true, duration: 0.35 })
+    m.panTo(here, { animate: false })
   }, [km, winStart, winEnd, pathMode])
 
   useEffect(() => {
@@ -3661,19 +3750,111 @@ function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
     group.addTo(m)
     iriLayerRef.current = group
     if (windowRef.current) windowRef.current.forEach((line) => line.bringToFront())
+    if (typeof assetLayerRef.current?.bringToFront === 'function') assetLayerRef.current.bringToFront()
     markerRef.current?.setZIndexOffset?.(800)
   }, [iriRecords, pathMode])
 
+  useEffect(() => {
+    const m = mapRef.current
+    const layer = assetLayerRef.current
+    if (!m || !layer) return
+    layer.clearLayers()
+    if (!mapAsset) return
+    const color =
+      (inventoryPoints || []).find((p) => p.asset === mapAsset)?.color ||
+      (inventoryLines || []).find((l) => l.asset === mapAsset)?.color ||
+      '#f59e0b'
+    let pts = (inventoryPoints || []).filter(
+      (p) => p.asset === mapAsset && Number.isFinite(Number(p.lat)) && Number.isFinite(Number(p.lng)),
+    )
+    if (pts.length > 3500) {
+      const step = Math.ceil(pts.length / 3500)
+      pts = pts.filter((_, i) => i % step === 0)
+    }
+    pts.forEach((p) => {
+      const mark = L.circleMarker([Number(p.lat), Number(p.lng)], {
+        radius: 6,
+        color: '#ffffff',
+        weight: 1.2,
+        fillColor: color,
+        fillOpacity: 0.95,
+        className: 'inv-marker',
+      })
+      const ch = Number.isFinite(Number(p.start)) ? Number(p.start).toFixed(2) : ''
+      mark.bindTooltip(`${p.asset || mapAsset}${ch ? ` · Ch ${ch}` : ''} · open in 3D`, {
+        direction: 'top',
+        offset: [0, -6],
+        className: 'ch-tip',
+      })
+      mark.on('click', (ev) => {
+        L.DomEvent.stop(ev)
+        onPickRef.current?.(p)
+      })
+      mark.addTo(layer)
+    })
+    ;(inventoryLines || [])
+      .filter((l) => l.asset === mapAsset && Array.isArray(l.latlngs) && l.latlngs.length > 1)
+      .forEach((l) => {
+        const line = L.polyline(
+          l.latlngs.map(([lat, lng]) => [lat, lng]),
+          { color, weight: 3.5, opacity: 0.92, className: 'inv-marker' },
+        )
+        line.bindTooltip(`${l.asset || mapAsset} · open in 3D`, { direction: 'top', className: 'ch-tip' })
+        line.on('click', (ev) => {
+          L.DomEvent.stop(ev)
+          onPickRef.current?.(l)
+        })
+        line.addTo(layer)
+      })
+    if (typeof layer.bringToFront === 'function') layer.bringToFront()
+    markerRef.current?.setZIndexOffset?.(800)
+  }, [mapAsset, inventoryPoints, inventoryLines])
+
+  return <div ref={wrap} className="absolute inset-0" />
+}
+
+/** Small map of the corridor. The road is coloured by IRI: good, fair, or poor. */
+function CorridorLocationMap({
+  km,
+  winStart,
+  winEnd,
+  iriRecords,
+  pathMode,
+  mapAsset,
+  onMapAsset,
+  onPickAsset,
+  inventoryPoints,
+  inventoryLines,
+  assetOptions = NONE,
+}) {
+  const [showBuildings, setShowBuildings] = useState(false)
+  const [base, setBase] = useState('satellite')
+  const here = latLngAtKm(km)
+  const roadGeo = useMemo(() => roadAnalysisGeo(iriRecords, pathMode), [iriRecords, pathMode])
+  const windowGeo = useMemo(() => windowAnalysisGeo(winStart, winEnd, pathMode), [winStart, winEnd, pathMode])
+
   return (
-    <div className="relative h-full min-h-0 w-full overflow-hidden">
-      <div ref={wrap} className={`absolute inset-0 ${showBuildings ? 'pointer-events-none' : ''}`} />
-      {showBuildings && (
+    <div className="relative h-full min-h-0 w-full overflow-hidden bg-[#d5dde6]">
+      {showBuildings ? (
         <CorridorBuildingsMap
           center={[here[1], here[0]]}
           bearing={travelBearingDeg(km, pathMode)}
           roadGeo={roadGeo}
           windowGeo={windowGeo}
           basemap={base}
+        />
+      ) : (
+        <FlatCorridorMap
+          km={km}
+          winStart={winStart}
+          winEnd={winEnd}
+          iriRecords={iriRecords}
+          pathMode={pathMode}
+          base={base}
+          mapAsset={mapAsset}
+          inventoryPoints={inventoryPoints}
+          inventoryLines={inventoryLines}
+          onPickAsset={onPickAsset}
         />
       )}
       <style>{'.nanasa-here-arrow{background:transparent!important;border:none!important;}'}</style>
@@ -3700,6 +3881,21 @@ function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
             </button>
           ))}
         </div>
+        {assetOptions.length > 0 && (
+          <select
+            value={mapAsset || ''}
+            onChange={(e) => onMapAsset?.(e.target.value || null)}
+            className="max-w-[180px] rounded-lg border-0 bg-black/75 px-2 py-1 text-[12px] font-semibold text-white shadow outline-none [&>option]:bg-slate-900"
+            title="Show inventory asset on map"
+          >
+            <option value="">No asset filter</option>
+            {assetOptions.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.id}
+              </option>
+            ))}
+          </select>
+        )}
       </div>
       {showBuildings && (
         <p className="pointer-events-none absolute bottom-2 right-12 z-[600] max-w-[220px] text-right text-[11px] font-semibold text-white [text-shadow:0_1px_2px_rgba(0,0,0,0.9)]">
@@ -3708,6 +3904,7 @@ function CorridorLocationMap({ km, winStart, winEnd, iriRecords, pathMode }) {
       )}
       <div className="pointer-events-none absolute bottom-2 left-2 z-[600] rounded-lg bg-black/75 px-2 py-1 text-[11px] font-semibold text-white shadow">
         You are here · Ch {Number(km).toFixed(2)} km
+        {mapAsset ? ` · ${mapAsset}` : ''}
       </div>
       <div className="pointer-events-none absolute right-2 top-12 z-[600] flex items-center gap-2 rounded-lg bg-black/75 px-2 py-1 text-[11px] font-semibold text-white shadow">
         {[
@@ -3731,118 +3928,205 @@ function surveyTick(d) {
 }
 
 function IriTrendChart({ points, activeDate }) {
+  const wrapRef = useRef(null)
+  const [size, setSize] = useState({ w: 0, h: 0 })
+
+  useEffect(() => {
+    const el = wrapRef.current
+    if (!el) return undefined
+    const measure = () => {
+      const r = el.getBoundingClientRect()
+      const w = Math.max(1, Math.round(r.width))
+      const h = Math.max(1, Math.round(r.height))
+      setSize((prev) => (prev.w === w && prev.h === h ? prev : { w, h }))
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
   if (!points?.length) return null
+
   const lanes = ['L1', 'L2']
   const colors = { L1: '#facc15', L2: '#38bdf8' }
-  const w = 1100
-  const h = 230
-  const pad = { l: 86, r: 56, t: 14, b: 40 }
+  const { w, h } = size
+  const ready = w > 40 && h > 40
+  const scale = ready ? Math.min(w / 320, h / 160, 1.35) : 1
+  const font = Math.max(10, Math.round(11 * scale))
+  const pad = {
+    l: Math.max(36, Math.round(42 * scale)),
+    r: Math.max(8, Math.round(12 * scale)),
+    t: Math.max(10, Math.round(12 * scale)),
+    b: Math.max(24, Math.round(28 * scale)),
+  }
+  const stroke = Math.max(1.8, 2.4 * scale)
+  const rDot = Math.max(3, 4.2 * scale)
+  const rActive = Math.max(4.5, 6 * scale)
+
   const samples = points.flatMap((p) => lanes.map((lane) => (Number.isFinite(p[lane]) ? p[lane] * 1000 : null))).filter((v) => v != null)
   const dataMax = Math.max(2400, ...samples)
   const dataMin = Math.min(1800, ...samples)
   const span = Math.max(600, dataMax - dataMin)
   const yMax = dataMax + span * 0.18
   const yMin = Math.max(0, dataMin - span * 0.28)
-  const innerW = w - pad.l - pad.r
-  const innerH = h - pad.t - pad.b
+  const innerW = Math.max(1, w - pad.l - pad.r)
+  const innerH = Math.max(1, h - pad.t - pad.b)
   const xAt = (i) => pad.l + (points.length === 1 ? innerW / 2 : (i / (points.length - 1)) * innerW)
   const yAt = (iri) => pad.t + (1 - (iri * 1000 - yMin) / (yMax - yMin)) * innerH
   const baseline = pad.t + innerH
   const coords = (lane) => points
     .map((p, i) => (Number.isFinite(p[lane]) ? [xAt(i), yAt(p[lane])] : null))
     .filter(Boolean)
+
+  // Skip some x labels when the panel is narrow so they stay readable.
+  const labelStep = w < 280 ? Math.ceil(points.length / 4) : w < 400 ? Math.ceil(points.length / 5) : 1
+
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} className="block h-full min-h-0 w-full" role="img" aria-label="IRI over survey dates" preserveAspectRatio="xMidYMid meet">
-      <defs>
-        <linearGradient id="iriFillL1" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#facc15" stopOpacity="0.28" />
-          <stop offset="100%" stopColor="#facc15" stopOpacity="0" />
-        </linearGradient>
-        <linearGradient id="iriFillL2" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.28" />
-          <stop offset="100%" stopColor="#38bdf8" stopOpacity="0" />
-        </linearGradient>
-      </defs>
-      {[1800, 2400].filter((mm) => mm > yMin && mm < yMax).map((mm) => (
-        <g key={mm}>
-          <line x1={pad.l} x2={w - pad.r} y1={yAt(mm / 1000)} y2={yAt(mm / 1000)} stroke="#1e293b" strokeDasharray="4 4" />
-          <text x={pad.l - 12} y={yAt(mm / 1000) + 6} textAnchor="end" fill="#94a3b8" fontSize="22">{mm}</text>
-        </g>
-      ))}
-      {points.map((p, i) => (
-        p.date === activeDate ? (
-          <line key={`guide-${p.date}`} x1={xAt(i)} x2={xAt(i)} y1={pad.t} y2={baseline} stroke="#ffffff" strokeOpacity="0.16" />
-        ) : null
-      ))}
-      {lanes.map((lane) => {
-        const pts = coords(lane)
-        if (pts.length < 2) return null
-        const line = pts.map((p, i) => `${i ? 'L' : 'M'}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join('')
-        const area = `${line} L${pts[pts.length - 1][0].toFixed(1)},${baseline} L${pts[0][0].toFixed(1)},${baseline} Z`
-        return (
-          <g key={lane}>
-            <path d={area} fill={`url(#iriFill${lane})`} />
-            <path d={line} fill="none" stroke={colors[lane]} strokeWidth="4" strokeLinejoin="round" strokeLinecap="round" />
-          </g>
-        )
-      })}
-      {points.map((p, i) => lanes.map((lane) => (
-        Number.isFinite(p[lane]) ? (
-          <circle
-            key={`${lane}-${p.date}`}
-            cx={xAt(i)}
-            cy={yAt(p[lane])}
-            r={p.date === activeDate ? 8 : 5.5}
-            fill={colors[lane]}
-            stroke={p.date === activeDate ? '#ffffff' : '#0b1220'}
-            strokeWidth={p.date === activeDate ? 3 : 2}
-          />
-        ) : null
-      )))}
-      {points.map((p, i) => (
-        <text key={p.date} x={xAt(i)} y={h - 10} textAnchor="middle" fill={p.date === activeDate ? '#f8fafc' : '#cbd5e1'} fontSize="22" fontWeight={p.date === activeDate ? '700' : '600'}>
-          {surveyTick(p.date)}
-        </text>
-      ))}
-    </svg>
+    <div ref={wrapRef} className="h-full min-h-0 w-full">
+      {ready ? (
+        <svg width={w} height={h} className="block overflow-visible" role="img" aria-label="IRI over survey dates">
+          <defs>
+            <linearGradient id="iriFillL1" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#facc15" stopOpacity="0.28" />
+              <stop offset="100%" stopColor="#facc15" stopOpacity="0" />
+            </linearGradient>
+            <linearGradient id="iriFillL2" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.28" />
+              <stop offset="100%" stopColor="#38bdf8" stopOpacity="0" />
+            </linearGradient>
+          </defs>
+          {[1800, 2400].filter((mm) => mm > yMin && mm < yMax).map((mm) => (
+            <g key={mm}>
+              <line x1={pad.l} x2={w - pad.r} y1={yAt(mm / 1000)} y2={yAt(mm / 1000)} stroke="#334155" strokeDasharray="4 4" />
+              <text x={pad.l - 6} y={yAt(mm / 1000) + font * 0.35} textAnchor="end" fill="#94a3b8" fontSize={font} fontWeight="600">{mm}</text>
+            </g>
+          ))}
+          {points.map((p, i) => (
+            p.date === activeDate ? (
+              <line key={`guide-${p.date}`} x1={xAt(i)} x2={xAt(i)} y1={pad.t} y2={baseline} stroke="#ffffff" strokeOpacity="0.16" />
+            ) : null
+          ))}
+          {lanes.map((lane) => {
+            const pts = coords(lane)
+            if (pts.length < 2) return null
+            const line = pts.map((p, i) => `${i ? 'L' : 'M'}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join('')
+            const area = `${line} L${pts[pts.length - 1][0].toFixed(1)},${baseline} L${pts[0][0].toFixed(1)},${baseline} Z`
+            return (
+              <g key={lane}>
+                <path d={area} fill={`url(#iriFill${lane})`} />
+                <path d={line} fill="none" stroke={colors[lane]} strokeWidth={stroke} strokeLinejoin="round" strokeLinecap="round" />
+              </g>
+            )
+          })}
+          {points.map((p, i) => lanes.map((lane) => (
+            Number.isFinite(p[lane]) ? (
+              <circle
+                key={`${lane}-${p.date}`}
+                cx={xAt(i)}
+                cy={yAt(p[lane])}
+                r={p.date === activeDate ? rActive : rDot}
+                fill={colors[lane]}
+                stroke={p.date === activeDate ? '#ffffff' : '#0b1220'}
+                strokeWidth={p.date === activeDate ? 2 : 1.5}
+              />
+            ) : null
+          )))}
+          {points.map((p, i) => {
+            const show = i === 0 || i === points.length - 1 || i % labelStep === 0 || p.date === activeDate
+            if (!show) return null
+            return (
+              <text
+                key={p.date}
+                x={xAt(i)}
+                y={h - Math.max(6, pad.b * 0.28)}
+                textAnchor="middle"
+                fill={p.date === activeDate ? '#f8fafc' : '#cbd5e1'}
+                fontSize={font}
+                fontWeight={p.date === activeDate ? '700' : '600'}
+              >
+                {surveyTick(p.date)}
+              </text>
+            )
+          })}
+        </svg>
+      ) : null}
+    </div>
   )
 }
 
 function CountTrendChart({ points, activeDate, color = '#38bdf8', label = 'Distress over survey dates' }) {
+  const wrapRef = useRef(null)
+  const [size, setSize] = useState({ w: 0, h: 0 })
   const rows = points || []
+
+  useEffect(() => {
+    const el = wrapRef.current
+    if (!el) return undefined
+    const measure = () => {
+      const r = el.getBoundingClientRect()
+      const w = Math.max(1, Math.round(r.width))
+      const h = Math.max(1, Math.round(r.height))
+      setSize((prev) => (prev.w === w && prev.h === h ? prev : { w, h }))
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
   if (!rows.length) return null
-  const w = 1100
-  const h = 220
-  const pad = { l: 28, r: 28, t: 36, b: 42 }
+
+  const { w, h } = size
+  const ready = w > 40 && h > 40
+  const scale = ready ? Math.min(w / 320, h / 140, 1.35) : 1
+  const font = Math.max(10, Math.round(11 * scale))
+  const pad = {
+    l: Math.max(10, Math.round(14 * scale)),
+    r: Math.max(10, Math.round(14 * scale)),
+    t: Math.max(22, Math.round(28 * scale)),
+    b: Math.max(24, Math.round(28 * scale)),
+  }
   const maxN = Math.max(...rows.map((p) => p.n), 1)
-  const innerW = w - pad.l - pad.r
-  const gap = 28
-  const barW = (innerW - gap * (rows.length - 1)) / rows.length
+  const innerW = Math.max(1, w - pad.l - pad.r)
+  const gap = Math.max(6, Math.round(10 * scale))
+  const barW = Math.max(8, (innerW - gap * (rows.length - 1)) / rows.length)
   const used = rows.length * barW + (rows.length - 1) * gap
   const origin = pad.l + (innerW - used) / 2
+  const labelStep = w < 280 ? Math.ceil(rows.length / 4) : 1
+
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} className="block h-full min-h-0 w-full" role="img" aria-label={label} preserveAspectRatio="xMidYMid meet">
-      <defs>
-        <linearGradient id="predBar" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor={color} stopOpacity="1" />
-          <stop offset="100%" stopColor={color} stopOpacity="0.35" />
-        </linearGradient>
-      </defs>
-      {rows.map((p, i) => {
-        const plotH = h - pad.t - pad.b
-        const bh = Math.max(p.n ? 6 : 2, (plotH * p.n) / maxN)
-        const x = origin + i * (barW + gap)
-        const y = h - pad.b - bh
-        const on = p.date === activeDate || (!activeDate && i === rows.length - 1)
-        return (
-          <g key={p.date}>
-            <text x={x + barW / 2} y={y - 10} textAnchor="middle" fill={on ? '#f8fafc' : '#cbd5e1'} fontSize="22" fontWeight="700">{p.n}</text>
-            <rect x={x} y={y} width={barW} height={bh} rx="8" fill={p.n ? 'url(#predBar)' : '#1e293b'} />
-            <text x={x + barW / 2} y={h - 12} textAnchor="middle" fill={on ? '#f8fafc' : '#cbd5e1'} fontSize="22" fontWeight={on ? '700' : '600'}>{surveyTick(p.date)}</text>
-          </g>
-        )
-      })}
-    </svg>
+    <div ref={wrapRef} className="h-full min-h-0 w-full">
+      {ready ? (
+        <svg width={w} height={h} className="block overflow-visible" role="img" aria-label={label}>
+          <defs>
+            <linearGradient id="predBar" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={color} stopOpacity="1" />
+              <stop offset="100%" stopColor={color} stopOpacity="0.35" />
+            </linearGradient>
+          </defs>
+          {rows.map((p, i) => {
+            const plotH = h - pad.t - pad.b
+            const bh = Math.max(p.n ? 5 : 2, (plotH * p.n) / maxN)
+            const x = origin + i * (barW + gap)
+            const y = h - pad.b - bh
+            const on = p.date === activeDate || (!activeDate && i === rows.length - 1)
+            const showLabel = i === 0 || i === rows.length - 1 || i % labelStep === 0 || on
+            return (
+              <g key={p.date}>
+                <text x={x + barW / 2} y={y - 6} textAnchor="middle" fill={on ? '#f8fafc' : '#cbd5e1'} fontSize={font} fontWeight="700">{p.n}</text>
+                <rect x={x} y={y} width={barW} height={bh} rx={Math.max(3, 5 * scale)} fill={p.n ? 'url(#predBar)' : '#1e293b'} />
+                {showLabel ? (
+                  <text x={x + barW / 2} y={h - 8} textAnchor="middle" fill={on ? '#f8fafc' : '#cbd5e1'} fontSize={font} fontWeight={on ? '700' : '600'}>
+                    {surveyTick(p.date)}
+                  </text>
+                ) : null}
+              </g>
+            )
+          })}
+        </svg>
+      ) : null}
+    </div>
   )
 }
 
@@ -3855,6 +4139,7 @@ export default function NanasaRoad3DModal({
   pavementDate: pavementDateProp = '',
   initialChainageKm = null,
   initialPathMode = null,
+  initialMapAsset = null,
   entryKey = 0,
 }) {
   const host = useRef(null)
@@ -3863,6 +4148,8 @@ export default function NanasaRoad3DModal({
   const predictedFilterRef = useRef('off')
   const invPoints = useMemo(() => inventoryPoints || NONE, [inventoryPoints])
   const invLines = useMemo(() => inventoryLines || NONE, [inventoryLines])
+  const assetOptions = useMemo(() => invData.types || NONE, [])
+  const [mapAsset, setMapAsset] = useState(() => initialMapAsset || null)
 
   const pmsDates = useMemo(() => {
     const fromFile = (pmsData.dates || []).filter(Boolean)
@@ -4003,7 +4290,8 @@ export default function NanasaRoad3DModal({
       setFollowScrubber(true)
       setPlaying(false)
     }
-  }, [open, entryKey, initialChainageKm, initialPathMode]) // eslint-disable-line react-hooks/exhaustive-deps
+    setMapAsset(initialMapAsset || null)
+  }, [open, entryKey, initialChainageKm, initialPathMode, initialMapAsset]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!open) {
@@ -4683,6 +4971,7 @@ export default function NanasaRoad3DModal({
       const counts = group.userData.counts || {}
       const parts = []
       if (counts.buildings) parts.push(`${counts.buildings} buildings`)
+      if (counts.roads) parts.push(`${counts.roads} connecting roads`)
       if (counts.trees) parts.push(`${counts.trees} trees`)
       if (counts.structures) parts.push(`${counts.structures} structures`)
       setOsmStatus(parts.length ? `${parts.join(' · ')} within 200 m` : 'No mapped buildings or trees in this stretch')
@@ -4740,6 +5029,26 @@ export default function NanasaRoad3DModal({
     if (scrubT >= 0.999) setScrubT(0)
     setFollowScrubber(true)
     setPlaying(true)
+  }
+
+  /** Fly the chase camera to an inventory marker clicked on the corridor map. */
+  const locateInventory = (rec) => {
+    const s = Number(rec?.start)
+    if (!Number.isFinite(s)) return
+    const e = Number(rec.end)
+    const mid = Number.isFinite(e) && e > s ? (s + e) / 2 : s
+    const km = Math.max(CHAINAGE_MIN_KM, Math.min(CHAINAGE_MAX_KM, mid))
+    const road = String(rec.road || '').toLowerCase()
+    const d = String(rec.dir || '').toLowerCase()
+    const mode = road === 'service'
+      ? (d.startsWith('inc') ? 'sinc' : d.startsWith('dec') ? 'sdec' : pathMode)
+      : d.startsWith('inc') ? 'lhs' : d.startsWith('dec') ? 'rhs' : pathMode
+    setPlaying(false)
+    followRef.current = true
+    scrubRef.current.follow = true
+    setFollowScrubber(true)
+    setPathMode(mode)
+    setScrubT(scrubTFromChainageKm(mode, km))
   }
 
   /** Fly the chase camera to a distress record (card click). */
@@ -5281,6 +5590,12 @@ export default function NanasaRoad3DModal({
                 winEnd={chainageSlice.winEnd}
                 iriRecords={pmsRecords}
                 pathMode={pathMode}
+                mapAsset={mapAsset}
+                onMapAsset={setMapAsset}
+                onPickAsset={locateInventory}
+                inventoryPoints={invPoints}
+                inventoryLines={invLines}
+                assetOptions={assetOptions}
               />
               {windowButtons}
             </div>
@@ -5478,32 +5793,32 @@ export default function NanasaRoad3DModal({
               </div>
               </div>
               ) : (
-              <div className="flex min-h-0 flex-1 flex-col gap-2 px-2.5 pb-2.5">
-                <section className="flex min-h-0 flex-[1.35] flex-col overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-b from-white/[0.06] to-white/[0.02] p-2.5">
+              <div className="flex min-h-0 flex-1 flex-col gap-1.5 px-2 pb-2">
+                <section className="flex min-h-0 flex-[1.75] flex-col overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-b from-white/[0.06] to-white/[0.02] p-2">
                   <div className="mb-1 flex shrink-0 items-center justify-between gap-2">
-                    <p className="m-0 text-[13px] font-bold uppercase tracking-[0.14em] text-emerald-300">Roughness index</p>
-                    <div className="flex items-center gap-3 text-[13px] font-semibold text-slate-300">
+                    <p className="m-0 text-[12px] font-bold uppercase tracking-[0.12em] text-emerald-300 sm:text-[13px]">Roughness index</p>
+                    <div className="flex items-center gap-2.5 text-[12px] font-semibold text-slate-300 sm:text-[13px]">
                       <span className="inline-flex items-center gap-1.5"><i className="inline-block h-1.5 w-3 rounded-full bg-[#facc15]" />L1</span>
                       <span className="inline-flex items-center gap-1.5"><i className="inline-block h-1.5 w-3 rounded-full bg-[#38bdf8]" />L2</span>
                     </div>
                   </div>
-                  <div className="mb-1 grid shrink-0 grid-cols-2 gap-2">
+                  <div className="mb-1 grid shrink-0 grid-cols-2 gap-1.5">
                     {['L1', 'L2'].map((lane) => {
                       const point = iriTrend.find((p) => p.date === pavementDate) || iriTrend[iriTrend.length - 1]
                       const iri = point?.[lane]
                       const mm = Number.isFinite(Number(iri)) ? Math.round(Number(iri) * 1000) : null
                       const band = iriBand({ iri, pavement: 'Bituminous' })
                       return (
-                        <div key={lane} className="flex items-center justify-between gap-2 rounded-xl bg-black/25 px-2.5 py-1.5">
+                        <div key={lane} className="flex items-center justify-between gap-1.5 rounded-xl bg-black/25 px-2 py-1 sm:px-2.5 sm:py-1.5">
                           <div className="min-w-0">
-                            <p className="m-0 text-[12px] font-semibold uppercase tracking-wide text-slate-400">{lane === 'L1' ? 'Median lane' : 'Outer lane'}</p>
-                            <p className="m-0 text-[22px] font-semibold tabular-nums leading-tight text-white">
+                            <p className="m-0 text-[10px] font-semibold uppercase tracking-wide text-slate-400 sm:text-[12px]">{lane === 'L1' ? 'Median lane' : 'Outer lane'}</p>
+                            <p className="m-0 text-[18px] font-semibold tabular-nums leading-tight text-white sm:text-[22px]">
                               {mm == null ? '—' : mm.toLocaleString('en-IN')}
-                              <span className="ml-1 text-[13px] font-medium text-slate-400">mm/km</span>
+                              <span className="ml-1 text-[11px] font-medium text-slate-400 sm:text-[13px]">mm/km</span>
                             </p>
                           </div>
                           <span
-                            className="shrink-0 rounded-full px-2.5 py-1 text-[13px] font-bold"
+                            className="shrink-0 rounded-full px-2 py-0.5 text-[11px] font-bold sm:px-2.5 sm:py-1 sm:text-[13px]"
                             style={{
                               background: band === 'good' ? '#111111' : band === 'fair' ? '#eab308' : band === 'poor' ? '#e2e8f0' : '#334155',
                               color: band === 'poor' || band === 'fair' ? '#0f172a' : '#f8fafc',
@@ -5515,31 +5830,35 @@ export default function NanasaRoad3DModal({
                       )
                     })}
                   </div>
-                  <div className="min-h-0 flex-1">
+                  <div className="relative min-h-[140px] flex-1 sm:min-h-[160px]">
                     {iriTrend.length > 0 ? (
-                      <IriTrendChart points={iriTrend} activeDate={pavementDate} />
+                      <div className="absolute inset-0">
+                        <IriTrendChart points={iriTrend} activeDate={pavementDate} />
+                      </div>
                     ) : (
-                      <p className="m-0 px-1 py-6 text-center text-[12px] text-slate-400">No roughness surveys in this window</p>
+                      <p className="m-0 grid h-full place-items-center px-1 text-center text-[12px] text-slate-400">No roughness surveys in this window</p>
                     )}
                   </div>
                 </section>
-                <section className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-b from-white/[0.06] to-white/[0.02] p-2.5">
+                <section className="flex min-h-0 flex-[0.9] flex-col overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-b from-white/[0.06] to-white/[0.02] p-2">
                   <div className="mb-1 flex shrink-0 items-center justify-between gap-2">
                     <p className={`m-0 text-[13px] font-bold uppercase tracking-[0.14em] ${distressChartPredicted ? 'text-cyan-300' : 'text-amber-300'}`}>
                       {distressChartPredicted ? 'Predicted distress' : 'Reported distress'}
                     </p>
                     <span className="text-[13px] font-medium text-slate-400">Count in this window</span>
                   </div>
-                  <div className="min-h-0 flex-1">
+                  <div className="relative min-h-[100px] flex-1">
                     {distressTrend.some((p) => p.n) ? (
-                      <CountTrendChart
-                        points={distressTrend}
-                        activeDate={distressTrend.at(-1)?.date}
-                        color={distressChartPredicted ? '#38bdf8' : '#f59e0b'}
-                        label={distressChartPredicted ? 'Predicted distress over survey dates' : 'Reported distress over survey dates'}
-                      />
+                      <div className="absolute inset-0">
+                        <CountTrendChart
+                          points={distressTrend}
+                          activeDate={distressTrend.at(-1)?.date}
+                          color={distressChartPredicted ? '#38bdf8' : '#f59e0b'}
+                          label={distressChartPredicted ? 'Predicted distress over survey dates' : 'Reported distress over survey dates'}
+                        />
+                      </div>
                     ) : (
-                      <p className="m-0 px-1 py-6 text-center text-[12px] text-slate-400">
+                      <p className="m-0 grid h-full place-items-center px-1 text-center text-[12px] text-slate-400">
                         {distressChartPredicted ? 'No predicted distress in this window' : 'No reported distress in this window'}
                       </p>
                     )}
