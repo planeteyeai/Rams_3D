@@ -14,12 +14,7 @@ export default function App() {
               <span className="grid h-8 w-8 place-items-center rounded-md bg-[#0b1424] text-[10px] font-bold tracking-[0.08em] text-white">
                 NR
               </span>
-              <span className="flex min-w-0 flex-col leading-none">
-                <strong className="text-[14px] font-semibold tracking-[0.04em]">NHIT RAMS</strong>
-                <span className="mt-0.5 hidden truncate text-[11px] font-medium text-slate-500 sm:block">
-                  Road Asset Management · RoadVision Workflow
-                </span>
-              </span>
+              <strong className="text-[16px] font-semibold tracking-[0.04em]">RAMS²</strong>
             </NavLink>
           </div>
         </header>
