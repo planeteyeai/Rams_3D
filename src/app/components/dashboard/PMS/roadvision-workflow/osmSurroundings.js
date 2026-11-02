@@ -178,7 +178,8 @@ function centroid(ring) {
 
 function structureForm(tag) {
   const kind = String(tag || '')
-  if (/tower|mast|chimney|pole/.test(kind)) return 'tower'
+  if (/chimney/.test(kind)) return 'chimney'
+  if (/tower|mast|pole/.test(kind)) return 'pylon'
   if (/tank|silo|water_tower|reservoir/.test(kind)) return 'tank'
   return 'box'
 }
@@ -187,6 +188,35 @@ function insideCorridor(lng, lat, origin, line, clearM = ROAD_CLEAR_M) {
   const loc = lngLatToLocal(lng, lat, origin)
   const d = distToLine(loc.x, loc.z, line)
   return d >= clearM && d <= CORRIDOR_M
+}
+
+/** A tower is kept when it stands inside 200 m, or its span into the next tower crosses that strip. */
+function spanEntersCorridor(a, b, line) {
+  const dx = b.x - a.x
+  const dz = b.z - a.z
+  const steps = Math.max(2, Math.ceil(Math.hypot(dx, dz) / 30))
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps
+    if (distToLine(a.x + dx * t, a.z + dz * t, line) <= CORRIDOR_M) return true
+  }
+  return false
+}
+
+function pylonsTouchingCorridor(line, origin) {
+  const placed = STORED.filter((feature) => feature.kind === 'structure' && feature.form === 'pylon' && feature.at).map((feature) => {
+    const loc = lngLatToLocal(feature.at[0], feature.at[1], origin)
+    return { feature, loc, keep: distToLine(loc.x, loc.z, line) <= CORRIDOR_M }
+  })
+  for (let i = 0; i < placed.length; i++) {
+    for (let j = i + 1; j < placed.length; j++) {
+      const span = Math.hypot(placed[i].loc.x - placed[j].loc.x, placed[i].loc.z - placed[j].loc.z)
+      if (span < 140 || span > 520) continue
+      if (!spanEntersCorridor(placed[i].loc, placed[j].loc, line)) continue
+      placed[i].keep = true
+      placed[j].keep = true
+    }
+  }
+  return placed.filter((pylon) => pylon.keep).map((pylon) => pylon.feature)
 }
 
 const STORED = (surroundingsData.features || []).map((row) => {
@@ -214,7 +244,7 @@ const STORED = (surroundingsData.features || []).map((row) => {
     id: row.id,
     kind: 'structure',
     at: row.at,
-    height: parseMeters(tags.height) || (structureForm(made) === 'tower' ? 12 : 6),
+    height: parseMeters(tags.height) || (structureForm(made) === 'pylon' ? 34 : 6),
     form: structureForm(made),
   }
 })
@@ -239,15 +269,17 @@ const FOOTPRINT_BUILDINGS = (buildingsData.features || [])
 
 export function loadSurroundings(coords, origin) {
   const line = coords.map(([lng, lat]) => lngLatToLocal(lng, lat, origin))
+  const pylons = pylonsTouchingCorridor(line, origin)
   const osm = STORED.filter((feature) => {
     if (!feature.at) return false
+    if (feature.kind === 'structure' && feature.form === 'pylon') return false
     const clear = feature.kind === 'building' ? BUILDING_CLEAR_M : ROAD_CLEAR_M
     return insideCorridor(feature.at[0], feature.at[1], origin, line, clear)
   })
   const footprints = FOOTPRINT_BUILDINGS.filter((feature) =>
     insideCorridor(feature.at[0], feature.at[1], origin, line, BUILDING_CLEAR_M),
   )
-  return Promise.resolve([...osm, ...footprints])
+  return Promise.resolve([...osm, ...footprints, ...pylons])
 }
 
 function buildingGeometry(pts, height) {
@@ -344,13 +376,263 @@ function addTrees(group, features, origin) {
   return trees.length
 }
 
+const PYLON_H = 34
+
+function steelMember(x0, y0, z0, x1, y1, z1, thick) {
+  const dx = x1 - x0
+  const dy = y1 - y0
+  const dz = z1 - z0
+  const len = Math.hypot(dx, dy, dz)
+  if (len < 0.05) return null
+  const geo = new THREE.BoxGeometry(thick, len, thick)
+  geo.translate(0, len / 2, 0)
+  geo.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(
+    new THREE.Vector3(0, 1, 0),
+    new THREE.Vector3(dx / len, dy / len, dz / len),
+  ))
+  geo.translate(x0, y0, z0)
+  return geo
+}
+
+/** Lattice transmission tower, 34 m, crossarms across local X and the line along local Z. */
+function pylonGeometry() {
+  const parts = []
+  const add = (geo) => { if (geo) parts.push(geo) }
+  const halfAt = (y) => {
+    const t = Math.min(1, Math.max(0, y / 30))
+    return 2.55 * (1 - t) + 0.42 * t
+  }
+  const corner = (y, sx, sz) => [sx * halfAt(y), y, sz * halfAt(y)]
+  const signs = [[1, 1], [1, -1], [-1, -1], [-1, 1]]
+  signs.forEach(([sx, sz]) => {
+    const [x0, y0, z0] = corner(0, sx, sz)
+    const [x1, y1, z1] = corner(30, sx, sz)
+    add(steelMember(x0, y0, z0, x1, y1, z1, 0.16))
+    add(steelMember(x1, y1, z1, 0, 34, 0, 0.08))
+    add(steelMember(sx * 0.55, 0, sz * 0.55, x0, 0.15, z0, 0.22))
+  })
+  ;[7, 14, 21, 28].forEach((y) => {
+    for (let i = 0; i < 4; i++) {
+      const a = corner(y, signs[i][0], signs[i][1])
+      const b = corner(y, signs[(i + 1) % 4][0], signs[(i + 1) % 4][1])
+      add(steelMember(a[0], a[1], a[2], b[0], b[1], b[2], 0.1))
+    }
+  })
+  ;[[0, 8], [8, 16], [16, 24]].forEach(([y0, y1]) => {
+    for (let i = 0; i < 4; i++) {
+      const s0 = signs[i]
+      const s1 = signs[(i + 1) % 4]
+      const a0 = corner(y0, s0[0], s0[1])
+      const b0 = corner(y0, s1[0], s1[1])
+      const a1 = corner(y1, s0[0], s0[1])
+      const b1 = corner(y1, s1[0], s1[1])
+      add(steelMember(a0[0], a0[1], a0[2], b1[0], b1[1], b1[2], 0.07))
+      add(steelMember(b0[0], b0[1], b0[2], a1[0], a1[1], a1[2], 0.07))
+    }
+  })
+  const arms = [
+    { y: 24.2, half: 4.7, thick: 0.16, drop: 1.35 },
+    { y: 28.4, half: 3.8, thick: 0.14, drop: 1.2 },
+    { y: 33.1, half: 2.15, thick: 0.1, drop: 0.35 },
+  ]
+  arms.forEach((arm) => {
+    add(steelMember(-arm.half, arm.y, 0, arm.half, arm.y, 0, arm.thick))
+    ;[-arm.half, arm.half].forEach((x) => {
+      add(steelMember(x, arm.y, 0, x, arm.y - arm.drop, 0, 0.06))
+    })
+  })
+  const merged = mergeGeometries(parts, false)
+  parts.forEach((geo) => geo.dispose())
+  return merged
+}
+
+const PYLON_ARMS = [
+  { y: 24.2 - 1.35, x: 4.7 },
+  { y: 28.4 - 1.2, x: 3.8 },
+  { y: 33.1 - 0.35, x: 2.15 },
+]
+
+function chainPylons(placed) {
+  const n = placed.length
+  const nbrs = Array.from({ length: n }, () => [])
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const d = Math.hypot(placed[i].loc.x - placed[j].loc.x, placed[i].loc.z - placed[j].loc.z)
+      if (d >= 140 && d <= 540) {
+        nbrs[i].push({ j, d })
+        nbrs[j].push({ j: i, d })
+      }
+    }
+  }
+  const bestStep = (from, prev) => {
+    const origin = placed[from].loc
+    let vx = 0
+    let vz = 0
+    if (prev != null) {
+      vx = origin.x - placed[prev].loc.x
+      vz = origin.z - placed[prev].loc.z
+    }
+    let best = null
+    let bestScore = Infinity
+    nbrs[from].forEach(({ j, d }) => {
+      if (j === prev || placed[j].used) return
+      const wx = placed[j].loc.x - origin.x
+      const wz = placed[j].loc.z - origin.z
+      let align = 1
+      if (prev != null) {
+        const mag = Math.hypot(vx, vz) * Math.hypot(wx, wz)
+        align = mag > 0 ? (vx * wx + vz * wz) / mag : 1
+        if (align < 0.8) return
+      }
+      const score = Math.abs(d - 310) + (1 - align) * 120
+      if (score < bestScore) {
+        bestScore = score
+        best = j
+      }
+    })
+    return best
+  }
+  const spans = []
+  const walk = (prev, start) => {
+    let cur = start
+    let before = prev
+    while (true) {
+      const nxt = bestStep(cur, before)
+      if (nxt == null) break
+      spans.push([cur, nxt])
+      placed[nxt].used = true
+      before = cur
+      cur = nxt
+    }
+  }
+  const order = placed.map((_, i) => i).sort((a, b) => nbrs[a].length - nbrs[b].length)
+  order.forEach((seed) => {
+    if (placed[seed].used || !nbrs[seed].length) return
+    placed[seed].used = true
+    const first = bestStep(seed, null)
+    if (first == null) return
+    spans.push([seed, first])
+    placed[first].used = true
+    walk(seed, first)
+    const second = bestStep(seed, first)
+    if (second == null) return
+    spans.push([seed, second])
+    placed[second].used = true
+    walk(seed, second)
+  })
+  return spans
+}
+
+function conductorGeometry(spans, placed) {
+  const geos = []
+  spans.forEach(([a, b]) => {
+    const span = Math.hypot(placed[b].loc.x - placed[a].loc.x, placed[b].loc.z - placed[a].loc.z)
+    const sag = Math.min(9, Math.max(2.2, span * 0.028))
+    PYLON_ARMS.forEach((arm) => {
+      ;[-arm.x, arm.x].forEach((x) => {
+        const p0 = armTip(placed[a], x, arm.y)
+        const p1 = armTip(placed[b], x, arm.y)
+        const curve = new THREE.CatmullRomCurve3([0, 0.5, 1].map((t) => new THREE.Vector3(
+          p0.x + (p1.x - p0.x) * t,
+          p0.y + (p1.y - p0.y) * t - sag * Math.sin(Math.PI * t),
+          p0.z + (p1.z - p0.z) * t,
+        )))
+        geos.push(new THREE.TubeGeometry(curve, 4, 0.1, 3, false))
+      })
+    })
+  })
+  if (!geos.length) return null
+  const merged = mergeGeometries(geos, false)
+  geos.forEach((geo) => geo.dispose())
+  return merged
+}
+
+function armTip(pylon, lx, ly) {
+  const theta = pylon.theta
+  return new THREE.Vector3(
+    pylon.loc.x + lx * Math.cos(theta),
+    ly * pylon.scaleY,
+    pylon.loc.z - lx * Math.sin(theta),
+  )
+}
+
+function addPylons(group, items, origin) {
+  if (!items.length) return 0
+  const geo = pylonGeometry()
+  if (!geo) return 0
+  const mesh = new THREE.InstancedMesh(
+    geo,
+    new THREE.MeshStandardMaterial({ color: 0xb4bcc4, roughness: 0.38, metalness: 0.72 }),
+    items.length,
+  )
+  const dummy = new THREE.Object3D()
+  const placed = items.map((item) => {
+    const loc = lngLatToLocal(item.at[0], item.at[1], origin)
+    const height = Math.max(18, Math.min(item.height || PYLON_H, 80))
+    return { item, loc, height, scaleY: height / PYLON_H, theta: 0, used: false }
+  })
+  const spans = chainPylons(placed)
+  const yawOf = new Map()
+  spans.forEach(([a, b]) => {
+    const dx = placed[b].loc.x - placed[a].loc.x
+    const dz = placed[b].loc.z - placed[a].loc.z
+    const theta = Math.atan2(dx, dz)
+    ;[a, b].forEach((i) => {
+      const prev = yawOf.get(i)
+      yawOf.set(i, prev == null ? theta : Math.atan2(Math.sin(prev) + Math.sin(theta), Math.cos(prev) + Math.cos(theta)))
+    })
+  })
+  placed.forEach((pylon, i) => {
+    let theta = yawOf.get(i)
+    if (theta == null) {
+      let best = null
+      let bestD = Infinity
+      placed.forEach((other, j) => {
+        if (i === j) return
+        const d = Math.hypot(other.loc.x - pylon.loc.x, other.loc.z - pylon.loc.z)
+        if (d < bestD) {
+          bestD = d
+          best = other
+        }
+      })
+      theta = best
+        ? Math.atan2(best.loc.x - pylon.loc.x, best.loc.z - pylon.loc.z)
+        : 0
+    }
+    pylon.theta = theta
+    dummy.position.set(pylon.loc.x, 0, pylon.loc.z)
+    dummy.rotation.set(0, theta, 0)
+    dummy.scale.set(1, pylon.scaleY, 1)
+    dummy.updateMatrix()
+    mesh.setMatrixAt(i, dummy.matrix)
+  })
+  mesh.instanceMatrix.needsUpdate = true
+  mesh.name = 'osmPylons'
+  group.add(mesh)
+  const wires = conductorGeometry(spans, placed)
+  if (wires) {
+    const line = new THREE.Mesh(
+      wires,
+      new THREE.MeshStandardMaterial({ color: 0x1c2126, roughness: 0.55, metalness: 0.35 }),
+    )
+    line.name = 'osmConductors'
+    group.add(line)
+  }
+  return items.length
+}
+
 function addStructures(group, features, origin) {
   const items = features.filter((feature) => feature.kind === 'structure')
   if (!items.length) return 0
-  const byForm = { tower: [], tank: [], box: [] }
-  items.forEach((item) => byForm[item.form || 'box'].push(item))
+  const pylons = items.filter((item) => item.form === 'pylon')
+  const byForm = { chimney: [], tank: [], box: [] }
+  items.forEach((item) => {
+    if (item.form === 'pylon') return
+    const form = byForm[item.form] ? item.form : 'box'
+    byForm[form].push(item)
+  })
   const specs = {
-    tower: () => new THREE.CylinderGeometry(0.35, 0.55, 1, 8),
+    chimney: () => new THREE.CylinderGeometry(0.35, 0.55, 1, 8),
     tank: () => new THREE.CylinderGeometry(1.1, 1.1, 1, 10),
     box: () => new THREE.BoxGeometry(2.2, 1, 2.2),
   }
@@ -371,7 +653,7 @@ function addStructures(group, features, origin) {
     mesh.name = `osm${form}`
     group.add(mesh)
   })
-  return items.length
+  return addPylons(group, pylons, origin) + items.length - pylons.length
 }
 
 function ribbonGeometry(raw) {
@@ -435,6 +717,16 @@ function addConnectingRoads(group, origin) {
     group.add(mesh)
   })
   return kept
+}
+
+export function createTransmissionGroup(origin) {
+  const coords = medianData.coordinates || []
+  const line = coords.map(([lng, lat]) => lngLatToLocal(lng, lat, origin))
+  const pylons = pylonsTouchingCorridor(line, origin)
+  const group = new THREE.Group()
+  group.name = 'transmission'
+  addPylons(group, pylons, origin)
+  return group
 }
 
 export function createSurroundingsGroup(features, origin) {

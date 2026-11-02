@@ -3408,6 +3408,49 @@ function latLngAtKm(km) {
   return [lat0 + (lat1 - lat0) * t, lng0 + (lng1 - lng0) * t]
 }
 
+/** Nearest chainage on the median. offsetM is metres off the centreline; side is LHS (−1) or RHS (+1). */
+const LIVE_NEAR_M = 400
+function snapLatLngToChainage(lat, lng) {
+  const coords = medianData.coordinates || []
+  if (coords.length < 2 || !Number.isFinite(lat) || !Number.isFinite(lng)) return null
+  const cos = Math.cos((lat * Math.PI) / 180)
+  const xOf = (lng0) => lng0 * cos * 111320
+  const yOf = (lat0) => lat0 * 110540
+  const px = xOf(lng)
+  const py = yOf(lat)
+  let best = Infinity
+  let along = 0
+  let side = SIDE_LHS
+  let walked = 0
+  for (let i = 1; i < coords.length; i++) {
+    const [lng0, lat0] = coords[i - 1]
+    const [lng1, lat1] = coords[i]
+    const ax = xOf(lng0)
+    const ay = yOf(lat0)
+    const bx = xOf(lng1)
+    const by = yOf(lat1)
+    const dx = bx - ax
+    const dy = by - ay
+    const len2 = dx * dx + dy * dy
+    const len = Math.sqrt(len2) || 1
+    let t = len2 > 0 ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0
+    t = Math.max(0, Math.min(1, t))
+    const ox = px - (ax + dx * t)
+    const oy = py - (ay + dy * t)
+    const d2 = ox * ox + oy * oy
+    if (d2 < best) {
+      best = d2
+      along = walked + len * t
+      const cross = dx * oy - dy * ox
+      side = cross >= 0 ? SIDE_LHS : SIDE_RHS
+    }
+    walked += len
+  }
+  const span = CHAINAGE_MAX_KM - CHAINAGE_MIN_KM || 1
+  const km = CHAINAGE_MIN_KM + (along / (walked || 1)) * span
+  return { km, offsetM: Math.sqrt(best), side }
+}
+
 const IRI_MAP_COLORS = {
   good: '#16a34a',
   fair: '#facc15',
@@ -3610,10 +3653,12 @@ function windowAnalysisGeo(winStart, winEnd, pathMode) {
 }
 
 /** Fresh Leaflet map. Remounted whenever the user returns from the 3D buildings view. */
-function FlatCorridorMap({ km, winStart, winEnd, iriRecords, pathMode, base, mapAsset, inventoryPoints, inventoryLines, onPickAsset }) {
+function FlatCorridorMap({ km, winStart, winEnd, iriRecords, pathMode, base, mapAsset, inventoryPoints, inventoryLines, onPickAsset, gps = null, gpsNear = true }) {
   const wrap = useRef(null)
   const mapRef = useRef(null)
   const markerRef = useRef(null)
+  const gpsRef = useRef(null)
+  const gpsAwayRef = useRef(false)
   const windowRef = useRef(null)
   const iriLayerRef = useRef(null)
   const assetLayerRef = useRef(null)
@@ -3723,8 +3768,41 @@ function FlatCorridorMap({ km, winStart, winEnd, iriRecords, pathMode, base, map
       }).filter(Boolean)
     }
     prefetchCorridorTiles(m, km, pathMode)
-    m.panTo(here, { animate: false })
+    if (gpsAwayRef.current && gpsRef.current) m.panTo(gpsRef.current.getLatLng(), { animate: false })
+    else m.panTo(here, { animate: false })
   }, [km, winStart, winEnd, pathMode])
+
+  useEffect(() => {
+    const m = mapRef.current
+    if (!m) return
+    if (!gps || !Number.isFinite(gps[0]) || !Number.isFinite(gps[1])) {
+      gpsAwayRef.current = false
+      if (gpsRef.current) {
+        m.removeLayer(gpsRef.current)
+        gpsRef.current = null
+      }
+      return
+    }
+    const ll = [gps[0], gps[1]]
+    const away = !gpsNear
+    gpsAwayRef.current = away
+    const fillColor = away ? '#3b82f6' : '#22c55e'
+    if (!gpsRef.current) {
+      gpsRef.current = L.circleMarker(ll, {
+        radius: 7,
+        color: '#ffffff',
+        weight: 2,
+        fillColor,
+        fillOpacity: 1,
+      }).addTo(m)
+    } else {
+      gpsRef.current.setLatLng(ll)
+      gpsRef.current.setStyle({ fillColor })
+    }
+    gpsRef.current.bringToFront?.()
+    if (away) m.panTo(ll, { animate: false })
+    else m.panTo(latLngAtKm(poseRef.current.km), { animate: false })
+  }, [gps, gpsNear])
 
   useEffect(() => {
     const m = mapRef.current
@@ -3825,6 +3903,11 @@ function CorridorLocationMap({
   onPickAsset,
   inventoryPoints,
   inventoryLines,
+  gps = null,
+  gpsNear = true,
+  liveOn = false,
+  liveNote = '',
+  onToggleLive,
   assetOptions = NONE,
 }) {
   const [showBuildings, setShowBuildings] = useState(false)
@@ -3855,6 +3938,8 @@ function CorridorLocationMap({
           inventoryPoints={inventoryPoints}
           inventoryLines={inventoryLines}
           onPickAsset={onPickAsset}
+          gps={gps}
+          gpsNear={gpsNear}
         />
       )}
       <style>{'.nanasa-here-arrow{background:transparent!important;border:none!important;}'}</style>
@@ -3898,10 +3983,31 @@ function CorridorLocationMap({
         )}
       </div>
       {showBuildings && (
-        <p className="pointer-events-none absolute bottom-2 right-12 z-[600] max-w-[220px] text-right text-[11px] font-semibold text-white [text-shadow:0_1px_2px_rgba(0,0,0,0.9)]">
+        <p className="pointer-events-none absolute bottom-16 right-2 z-[600] max-w-[220px] text-right text-[11px] font-semibold text-white [text-shadow:0_1px_2px_rgba(0,0,0,0.9)]">
           Drag to rotate · Right-drag to tilt
         </p>
       )}
+      <div className="absolute bottom-7 right-2 z-[600] flex flex-col items-end gap-1">
+        {liveOn && liveNote ? (
+          <span className="max-w-[11rem] truncate rounded bg-black/75 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-100 shadow">
+            {liveNote}
+          </span>
+        ) : null}
+        <button
+          type="button"
+          onClick={onToggleLive}
+          title="Follow my location along the corridor"
+          aria-pressed={liveOn}
+          className={`inline-flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] font-semibold shadow ${
+            liveOn
+              ? 'border-emerald-300 bg-emerald-500 text-white'
+              : 'border-white/20 bg-black/75 text-white hover:bg-black/85'
+          }`}
+        >
+          <span className={`h-1.5 w-1.5 rounded-full ${liveOn ? 'animate-pulse bg-white' : 'bg-emerald-300'}`} />
+          {liveOn ? 'Live' : 'My location'}
+        </button>
+      </div>
       <div className="pointer-events-none absolute bottom-2 left-2 z-[600] rounded-lg bg-black/75 px-2 py-1 text-[11px] font-semibold text-white shadow">
         You are here · Ch {Number(km).toFixed(2)} km
         {mapAsset ? ` · ${mapAsset}` : ''}
@@ -4167,7 +4273,6 @@ export default function NanasaRoad3DModal({
   const [pavementDate, setPavementDate] = useState(
     () => pavementDateProp || pmsData.dates?.[0] || '',
   )
-  const [osmStatus, setOsmStatus] = useState('')
 
   useEffect(() => {
     if (!open) return
@@ -4239,6 +4344,11 @@ export default function NanasaRoad3DModal({
   const [playing, setPlaying] = useState(false)
   const [chromeMode, setChromeMode] = useState('normal') // normal | fullscreen | minimized
   const [windowLengthM, setWindowLengthM] = useState(100) // cards + highlight patch length
+  const [liveOn, setLiveOn] = useState(false)
+  const [liveNote, setLiveNote] = useState('')
+  const [liveGps, setLiveGps] = useState(null)
+  const [liveNear, setLiveNear] = useState(true)
+  const liveKmRef = useRef(null)
   const shellRef = useRef(null)
 
   const playingRef = useRef(false)
@@ -4296,6 +4406,11 @@ export default function NanasaRoad3DModal({
   useEffect(() => {
     if (!open) {
       setPlaying(false)
+      setLiveOn(false)
+      setLiveNote('')
+      setLiveGps(null)
+      setLiveNear(true)
+      liveKmRef.current = null
       setChromeMode('normal')
       setOpenLayerMenu(null)
       setSelectedReported(null)
@@ -4304,6 +4419,55 @@ export default function NanasaRoad3DModal({
       }
     }
   }, [open])
+
+  useEffect(() => {
+    if (!open || !liveOn) return undefined
+    if (!navigator.geolocation) {
+      setLiveNote('Location unavailable')
+      setLiveOn(false)
+      return undefined
+    }
+    setLiveNote('Locating…')
+    const id = navigator.geolocation.watchPosition(
+      (pos) => {
+        const lat = pos.coords.latitude
+        const lng = pos.coords.longitude
+        const snap = snapLatLngToChainage(lat, lng)
+        setLiveGps([lat, lng])
+        if (!snap || snap.offsetM > LIVE_NEAR_M) {
+          setLiveNear(false)
+          liveKmRef.current = null
+          setLiveNote('Not near this corridor')
+          return
+        }
+        setLiveNear(true)
+        const prev = liveKmRef.current
+        if (prev != null && Math.abs(prev - snap.km) < 0.004) {
+          setLiveNote(`Ch ${snap.km.toFixed(2)} km`)
+          return
+        }
+        liveKmRef.current = snap.km
+        const mode = snap.offsetM > 3
+          ? (snap.side === SIDE_RHS ? 'rhs' : 'lhs')
+          : pathModeRef.current
+        setPlaying(false)
+        followRef.current = true
+        scrubRef.current.follow = true
+        setFollowScrubber(true)
+        if (mode !== pathModeRef.current) setPathMode(mode)
+        setScrubT(scrubTFromChainageKm(mode, snap.km))
+        setLiveNote(`Ch ${snap.km.toFixed(2)} km`)
+      },
+      () => {
+        setLiveNote('Location blocked')
+        setLiveOn(false)
+        setLiveGps(null)
+        setLiveNear(true)
+      },
+      { enableHighAccuracy: true, maximumAge: 1000, timeout: 15000 },
+    )
+    return () => navigator.geolocation.clearWatch(id)
+  }, [open, liveOn])
 
   const enterBrowserFullscreen = useCallback(async () => {
     const el = shellRef.current
@@ -4968,13 +5132,6 @@ export default function NanasaRoad3DModal({
       }
       const group = createSurroundingsGroup(features, rt.origin)
       rt.root.add(group)
-      const counts = group.userData.counts || {}
-      const parts = []
-      if (counts.buildings) parts.push(`${counts.buildings} buildings`)
-      if (counts.roads) parts.push(`${counts.roads} connecting roads`)
-      if (counts.trees) parts.push(`${counts.trees} trees`)
-      if (counts.structures) parts.push(`${counts.structures} structures`)
-      setOsmStatus(parts.length ? `${parts.join(' · ')} within 200 m` : 'No mapped buildings or trees in this stretch')
     })
     return () => {
       stale = true
@@ -5245,9 +5402,6 @@ export default function NanasaRoad3DModal({
           <div className="pointer-events-none absolute left-4 top-4 z-20 [text-shadow:0_2px_4px_rgba(0,0,0,0.95),0_0_10px_rgba(0,0,0,0.8)]">
             <p className="m-0 text-[12px] font-bold uppercase tracking-[0.16em] text-slate-100">Road type</p>
             <p className="m-0 text-[22px] font-extrabold leading-tight text-white">{roadType}</p>
-            {osmStatus && (
-              <p className="m-0 mt-1 max-w-[240px] text-[12px] font-semibold text-white">{osmStatus}</p>
-            )}
           </div>
         )}
         {!isMinimized && (
@@ -5595,6 +5749,21 @@ export default function NanasaRoad3DModal({
                 onPickAsset={locateInventory}
                 inventoryPoints={invPoints}
                 inventoryLines={invLines}
+                gps={liveGps}
+                gpsNear={liveNear}
+                liveOn={liveOn}
+                liveNote={liveNote}
+                onToggleLive={() => {
+                  setLiveOn((on) => {
+                    if (on) {
+                      setLiveNote('')
+                      setLiveGps(null)
+                      setLiveNear(true)
+                      liveKmRef.current = null
+                    }
+                    return !on
+                  })
+                }}
                 assetOptions={assetOptions}
               />
               {windowButtons}

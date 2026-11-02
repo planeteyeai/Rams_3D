@@ -1,9 +1,11 @@
 import { useEffect, useRef } from 'react'
-import { Map as MapLibreMap, NavigationControl, setWorkerUrl } from 'maplibre-gl'
+import { Map as MapLibreMap, MercatorCoordinate, NavigationControl, setWorkerUrl } from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url'
+import * as THREE from 'three'
 import buildings from '../../../../../assets/data/nanasa-buildings.json'
 import medianData from '../../../../../assets/data/nanasa-median.json'
+import { createTransmissionGroup, disposeSurroundings } from './osmSurroundings'
 
 setWorkerUrl(workerUrl)
 
@@ -254,6 +256,59 @@ const wallPaint = [
 ]
 
 /**
+ * Same lattice pylons as the road model, drawn in this tilted map.
+ * Local metres are Y-up with +Z south, then mapped into MapLibre's mercator frame.
+ */
+function transmissionLayer(map, origin) {
+  const layer = {
+    id: 'transmission-towers',
+    type: 'custom',
+    renderingMode: '3d',
+    onAdd(_map, gl) {
+      this.scene = new THREE.Scene()
+      this.scene.add(new THREE.AmbientLight(0xffffff, 1.2))
+      const sun = new THREE.DirectionalLight(0xfff6ea, 1.45)
+      sun.position.set(60, 140, 30)
+      this.scene.add(sun)
+      this.group = createTransmissionGroup(origin)
+      this.scene.add(this.group)
+      this.camera = new THREE.Camera()
+      this.camera.matrixAutoUpdate = false
+      this.renderer = new THREE.WebGLRenderer({ canvas: map.getCanvas(), context: gl })
+      this.renderer.autoClear = false
+      const mc = MercatorCoordinate.fromLngLat([origin.lng, origin.lat], 0)
+      this.transform = {
+        x: mc.x,
+        y: mc.y,
+        z: mc.z || 0,
+        scale: mc.meterInMercatorCoordinateUnits(),
+      }
+      this.rotationX = new THREE.Matrix4().makeRotationAxis(new THREE.Vector3(1, 0, 0), Math.PI / 2)
+    },
+    render(_gl, args) {
+      if (!this.renderer || !this.transform) return
+      const t = this.transform
+      const matrix = args.defaultProjectionData?.mainMatrix || args.modelViewProjectionMatrix
+      const m = new THREE.Matrix4().fromArray(matrix)
+      const local = new THREE.Matrix4()
+        .makeTranslation(t.x, t.y, t.z)
+        .scale(new THREE.Vector3(t.scale, -t.scale, t.scale))
+        .multiply(this.rotationX)
+      this.camera.projectionMatrix = m.multiply(local)
+      this.renderer.resetState()
+      this.renderer.render(this.scene, this.camera)
+    },
+    onRemove() {
+      disposeSurroundings(this.group)
+      this.renderer?.dispose()
+      this.scene = null
+      this.group = null
+    },
+  }
+  return layer
+}
+
+/**
  * Tilt-and-rotate satellite view. Each block's roof colour is sampled from the
  * imagery, and the walls are a darker shade of that colour. Height is still
  * estimated from footprint size.
@@ -373,6 +428,10 @@ export default function CorridorBuildingsMap({ center, bearing, roadGeo, windowG
         source: 'window',
         paint: { 'line-color': '#ffffff', 'line-width': 1.6 },
       })
+      const towerOrigin = medianData.coordinates?.[0]
+      if (towerOrigin) {
+        map.addLayer(transmissionLayer(map, { lng: towerOrigin[0], lat: towerOrigin[1] }))
+      }
       paintVisible()
     })
     map.on('moveend', paintVisible)
